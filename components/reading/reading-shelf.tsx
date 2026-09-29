@@ -1,25 +1,29 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { ChevronLeft, Palette, Settings } from "lucide-react";
-import { loadBooks, addBook, deleteBook, saveChapters, loadProgress, saveRawFile } from "@/lib/reading-storage";
-import { decodeTxtArrayBuffer, parseTxtContent, parseEpubFile, PDF_PAGES_PER_CHAPTER } from "@/lib/reading-parser";
+import { ChevronLeft, Palette, Settings, UserRound } from "lucide-react";
+import { loadBooks, addBook, deleteBook, saveChapters, loadProgress, saveRawFile, countAnnotationsByBook } from "@/lib/reading-storage";
+import { loadCharacters } from "@/lib/character-storage";
+import { deleteReadingAssetsByPrefix, loadReadingCover, saveReadingAsset, saveReadingCover } from "@/lib/reading-appearance";
+import { readingImageAssetKey, readingImageAssetPrefix } from "@/lib/reading-inline-image";
+import { decodeTxtArrayBuffer, parseTxtContent, parseEpubFile, parseMobiFile, PDF_PAGES_PER_CHAPTER } from "@/lib/reading-parser";
 import { loadReadingInteractionConfig } from "@/lib/reading-storage";
 import type { Book, BookChapter } from "@/lib/reading-types";
 import type { ReadingAppearance } from "@/lib/reading-appearance";
-import { ReadingAppearanceDialog } from "./reading-appearance-dialog";
+import { ContentDialog } from "@/components/ui/modal";
+import { ReadingAppearanceDialog, type ReadingAppearanceSaveOptions, type ReadingLoadedFonts } from "./reading-appearance-dialog";
 import { ReadingInteractionDialog } from "./reading-interaction-dialog";
+import { ReadingProfileDialog } from "./reading-profile-dialog";
 import { kvGet, kvSet, kvRemove } from "@/lib/kv-db";
+import { READING_COVER_MAX_SIZE, compressReadingImage } from "@/lib/reading-image";
 
 type Props = {
     onOpenBook: (book: Book) => void;
     onClose: () => void;
     appearance: ReadingAppearance;
     backgroundUrl: string | null;
-    onSaveAppearance: (
-        appearance: ReadingAppearance,
-        options: { backgroundFile: File | null; clearBackground: boolean; customFontFile: File | null; clearCustomFont: boolean }
-    ) => Promise<void>;
+    loadedFonts: ReadingLoadedFonts;
+    onSaveAppearance: (appearance: ReadingAppearance, options: ReadingAppearanceSaveOptions) => Promise<void>;
 };
 
 const IMPORT_DIAG_KEY = "reading-import-diagnostic-v1";
@@ -86,8 +90,14 @@ function buildImportError(stage: string, err: unknown, format?: Book["format"]):
     };
 }
 
-export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, onSaveAppearance }: Props) {
+export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, loadedFonts, onSaveAppearance }: Props) {
     const [books, setBooks] = useState<Book[]>([]);
+    /** bookId → 封面 objectURL；没有封面的书不在这里，走原来那种自己画的封面 */
+    const [coverUrls, setCoverUrls] = useState<Record<string, string>>({});
+    /** bookId → 批注条数（用户 + 角色） */
+    const [annotationCounts, setAnnotationCounts] = useState<Record<string, number>>({});
+    /** bookId → 伴读角色名。名字一律从角色数据里取，不写死 */
+    const [companionNames, setCompanionNames] = useState<Record<string, string>>({});
     const [progressMap, setProgressMap] = useState<Record<string, {
         chapterIndex: number;
         total: number;
@@ -103,7 +113,15 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
     const [search, setSearch] = useState("");
     const [showAppearanceDialog, setShowAppearanceDialog] = useState(false);
     const [showInteractionDialog, setShowInteractionDialog] = useState(false);
+    const [showProfileDialog, setShowProfileDialog] = useState(false);
+    /** 已经有封面的书，点封面先弹这个小菜单（换 / 移除），没封面的直接开相册 */
+    const [coverMenuBook, setCoverMenuBook] = useState<Book | null>(null);
+    const [coverBusy, setCoverBusy] = useState(false);
     const fileRef = useRef<HTMLInputElement>(null);
+    const coverInputRef = useRef<HTMLInputElement>(null);
+    /** 正在设封面的书。存 ref 而不是 state：点完立刻要打开文件选择器，
+     *  state 这一拍还没落地，onChange 里就取不到目标书了。 */
+    const coverTargetRef = useRef<string | null>(null);
 
     const persistImportDiagnostic = (payload: ImportDiagnostic | null) => {
         if (typeof window === "undefined") return;
@@ -119,6 +137,8 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
         setBooks(allBooks);
         (async () => {
             const map: typeof progressMap = {};
+            const companions: Record<string, string> = {};
+            const characters = loadCharacters();
             for (const b of allBooks) {
                 const p = await loadProgress(b.id);
                 map[b.id] = {
@@ -130,11 +150,41 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
                     pageTotal: p?.progressTotal,
                     scope: p?.progressScope,
                 };
+                const companionId = p?.companionCharacterId;
+                const companionName = companionId
+                    ? characters.find((character) => character.id === companionId)?.name
+                    : undefined;
+                if (companionName) companions[b.id] = companionName;
             }
             setProgressMap(map);
+            setCompanionNames(companions);
+            setAnnotationCounts(await countAnnotationsByBook().catch(() => ({})));
         })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
+
+    // 封面按书逐本取。串行读：这几个资源共用一个 IndexedDB，并发打开会互相 block。
+    useEffect(() => {
+        let cancelled = false;
+        const created: string[] = [];
+        (async () => {
+            const map: Record<string, string> = {};
+            for (const b of books) {
+                const blob = await loadReadingCover(b.id).catch(() => null);
+                if (cancelled) break;
+                if (!blob || blob.size === 0) continue;
+                const url = URL.createObjectURL(blob);
+                created.push(url);
+                map[b.id] = url;
+            }
+            if (cancelled) { created.forEach(url => URL.revokeObjectURL(url)); return; }
+            setCoverUrls(prev => {
+                Object.values(prev).forEach(url => URL.revokeObjectURL(url));
+                return map;
+            });
+        })();
+        return () => { cancelled = true; };
+    }, [books]);
 
     useEffect(() => {
         if (typeof window === "undefined") return;
@@ -162,6 +212,50 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
         persistImportDiagnostic(null);
     };
 
+    /** 换掉一本书的封面图：null 表示恢复成自动生成的那种封面 */
+    const applyCover = async (bookId: string, blob: Blob | null) => {
+        setCoverBusy(true);
+        try {
+            await saveReadingCover(bookId, blob);
+            const nextUrl = blob ? URL.createObjectURL(blob) : null;
+            setCoverUrls(prev => {
+                const previous = prev[bookId];
+                if (previous) URL.revokeObjectURL(previous);
+                const next = { ...prev };
+                if (nextUrl) next[bookId] = nextUrl;
+                else delete next[bookId];
+                return next;
+            });
+        } catch (err) {
+            setImportError({
+                summary: "封面保存失败。",
+                detail: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+            });
+        } finally {
+            setCoverBusy(false);
+        }
+    };
+
+    const pickCoverFor = (bookId: string) => {
+        coverTargetRef.current = bookId;
+        coverInputRef.current?.click();
+    };
+
+    const handleCoverClick = (book: Book) => {
+        // 已有封面的书先问一句，否则误触就把 EPUB 自带封面换掉了，还退不回去
+        if (coverUrls[book.id]) setCoverMenuBook(book);
+        else pickCoverFor(book.id);
+    };
+
+    const handleCoverFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        e.target.value = "";
+        const bookId = coverTargetRef.current;
+        coverTargetRef.current = null;
+        if (!file || !bookId) return;
+        await applyCover(bookId, await compressReadingImage(file, READING_COVER_MAX_SIZE));
+    };
+
     const filteredBooks = search.trim()
         ? books.filter(b => b.title.toLowerCase().includes(search.toLowerCase()) || b.author?.toLowerCase().includes(search.toLowerCase()))
         : books;
@@ -175,7 +269,8 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
         setImportStatus("正在准备导入…");
         let importStage = "准备导入";
         const ext = file.name.split(".").pop()?.toLowerCase();
-        const detectedFormat = ext === "pdf" ? "pdf" : ext === "epub" ? "epub" : "txt";
+        const isMobiExt = ext === "mobi" || ext === "azw3" || ext === "azw" || ext === "prc";
+        const detectedFormat = ext === "pdf" ? "pdf" : ext === "epub" ? "epub" : isMobiExt ? "mobi" : "txt";
         persistImportDiagnostic({
             status: "running",
             stage: importStage,
@@ -229,6 +324,30 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
                 });
                 parsed = await parseEpubFile(buffer, file.name);
                 format = "epub";
+            } else if (isMobiExt) {
+                importStage = "读取 MOBI 文件";
+                setImportStatus("正在读取 MOBI 文件…");
+                persistImportDiagnostic({
+                    status: "running",
+                    stage: importStage,
+                    fileName: file.name,
+                    fileSize: file.size,
+                    format: "mobi",
+                    updatedAt: new Date().toISOString(),
+                });
+                const buffer = await file.arrayBuffer();
+                importStage = "解析 MOBI 内容";
+                setImportStatus("正在解析 MOBI 内容…");
+                persistImportDiagnostic({
+                    status: "running",
+                    stage: importStage,
+                    fileName: file.name,
+                    fileSize: file.size,
+                    format: "mobi",
+                    updatedAt: new Date().toISOString(),
+                });
+                parsed = await parseMobiFile(buffer, file.name);
+                format = "mobi";
             } else if (ext === "pdf") {
                 rawFile = file;
                 importStage = "创建 PDF 导入记录";
@@ -278,7 +397,16 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
                         pageEnd,
                     };
                 }
-                return { id: `${bookId}_ch${i}`, bookId, index: i, title: ch.title, paragraphs: ch.paragraphs };
+                // PDF 那条分支给的是个占位章节，没有 tocLevel，取值要容错
+                const tocLevel = (ch as { tocLevel?: number }).tocLevel;
+                return {
+                    id: `${bookId}_ch${i}`,
+                    bookId,
+                    index: i,
+                    title: ch.title,
+                    paragraphs: ch.paragraphs,
+                    ...(typeof tocLevel === "number" ? { tocLevel } : {}),
+                };
             });
 
             importStage = "写入书架数据";
@@ -293,6 +421,19 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
             });
             await addBook(book);
             await saveChapters(bookId, chapters);
+            if ("cover" in parsed && parsed.cover) {
+                await saveReadingCover(bookId, new Blob([parsed.cover.data], { type: parsed.cover.mime }))
+                    .catch(() => { /* 封面存不下不该挡住导入 */ });
+            }
+            const parsedImages = "images" in parsed ? parsed.images : undefined;
+            if (parsedImages && parsedImages.length > 0) {
+                importStage = "保存正文插图";
+                setImportStatus(`正在保存 ${parsedImages.length} 张插图…`);
+                for (const image of parsedImages) {
+                    // 单张图存不下不该让整本书导入失败，正文里那一格会显示成「插图加载失败」
+                    await saveReadingAsset(readingImageAssetKey(bookId, image.index), image.blob).catch(() => {});
+                }
+            }
             if (rawFile) {
                 try {
                     importStage = format === "pdf" ? "保存原始 PDF 文件" : "保存原始文件";
@@ -308,6 +449,8 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
                     await saveRawFile(bookId, rawFile);
                 } catch (saveErr) {
                     await deleteBook(bookId).catch(() => {});
+                    await saveReadingCover(bookId, null).catch(() => {});
+                    await deleteReadingAssetsByPrefix(readingImageAssetPrefix(bookId)).catch(() => {});
                     const built = buildImportError(importStage, saveErr, format);
                     setImportError(built);
                     persistImportDiagnostic({
@@ -349,6 +492,8 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
     const handleDelete = async (bookId: string) => {
         if (!confirm("确定删除这本书吗？")) return;
         await deleteBook(bookId);
+        await saveReadingCover(bookId, null).catch(() => {});
+        await deleteReadingAssetsByPrefix(readingImageAssetPrefix(bookId)).catch(() => {});
         setBooks(loadBooks());
     };
 
@@ -365,6 +510,9 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
                         <ChevronLeft size={22} strokeWidth={2.5} />
                     </button>
                     <div className="reading-shelf-actions">
+                        <button className="reading-shelf-action-btn" type="button" onClick={() => setShowProfileDialog(true)} aria-label="阅读账号">
+                            <UserRound size={16} strokeWidth={1.7} />
+                        </button>
                         <button className="reading-shelf-action-btn" type="button" onClick={() => setShowInteractionDialog(true)} aria-label="阅读设置">
                             <Settings size={16} strokeWidth={1.7} />
                         </button>
@@ -375,7 +523,7 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
                             <svg width={18} height={18} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                                 <path d="M12 5v14M5 12h14" />
                             </svg>
-                            <input ref={fileRef} type="file" accept=".txt,.epub,.pdf" onChange={handleFileUpload} className="hidden" disabled={importing} />
+                            <input ref={fileRef} type="file" accept=".txt,.epub,.mobi,.azw3,.prc,.pdf" onChange={handleFileUpload} className="hidden" disabled={importing} />
                         </label>
                     </div>
                 </div>
@@ -444,16 +592,44 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
                             const layout = coverLayouts[(book.title.length + (book.author?.length || 0)) % coverLayouts.length];
                             return (
                                 <div key={book.id} className="reading-list-item" onClick={() => onOpenBook(book)}>
-                                    <div className={`reading-list-cover reading-list-cover--${gradient} reading-list-cover--${layout}`}>
-                                        <span className="reading-list-cover-author">{book.author || ""}</span>
-                                        <span className="reading-list-cover-title">{book.title}</span>
-                                    </div>
+                                    {/* 点封面是换封面，不是打开书 */}
+                                    <button
+                                        type="button"
+                                        className="reading-list-cover-btn"
+                                        onClick={(e) => { e.stopPropagation(); handleCoverClick(book); }}
+                                        disabled={coverBusy}
+                                        aria-label={`设置《${book.title}》的封面`}
+                                    >
+                                        {coverUrls[book.id] ? (
+                                            <div className="reading-list-cover reading-list-cover--image">
+                                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                                <img src={coverUrls[book.id]} alt="" />
+                                            </div>
+                                        ) : (
+                                            <div className={`reading-list-cover reading-list-cover--${gradient} reading-list-cover--${layout}`}>
+                                                <span className="reading-list-cover-author">{book.author || ""}</span>
+                                                <span className="reading-list-cover-title">{book.title}</span>
+                                            </div>
+                                        )}
+                                    </button>
                                     <div className="reading-list-info">
                                         <span className="reading-list-title">{book.title}</span>
                                         {book.author && <span className="reading-list-author">{book.author}</span>}
                                         <div className="reading-list-meta">
                                             <span className="reading-list-badge">{formatBadge(book.format)}</span>
                                             <span>{book.totalChapters}章</span>
+                                            {annotationCounts[book.id] ? (
+                                                <>
+                                                    <span className="reading-list-badge">批注</span>
+                                                    <span>{annotationCounts[book.id]}条</span>
+                                                </>
+                                            ) : null}
+                                            {companionNames[book.id] ? (
+                                                <>
+                                                    <span className="reading-list-badge">伴读</span>
+                                                    <span className="reading-list-meta-value">{companionNames[book.id]}</span>
+                                                </>
+                                            ) : null}
                                         </div>
                                         <div className="reading-list-progress-row">
                                             <span className="reading-list-progress-label">
@@ -488,10 +664,56 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
                 </div>
             </div>
 
+            <input
+                ref={coverInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => { void handleCoverFileChange(e); }}
+            />
+
+            {coverMenuBook && (
+                <ContentDialog
+                    title="封面"
+                    confirmLabel=""
+                    cancelLabel="取消"
+                    onConfirm={() => setCoverMenuBook(null)}
+                    onCancel={() => setCoverMenuBook(null)}
+                >
+                    <div className="reading-settings-grid">
+                        <button
+                            type="button"
+                            className="ui-btn ui-btn-outline"
+                            disabled={coverBusy}
+                            onClick={() => {
+                                const target = coverMenuBook.id;
+                                setCoverMenuBook(null);
+                                pickCoverFor(target);
+                            }}
+                        >
+                            从相册选择图片
+                        </button>
+                        <button
+                            type="button"
+                            className="ui-btn ui-btn-outline"
+                            disabled={coverBusy}
+                            onClick={() => {
+                                const target = coverMenuBook.id;
+                                setCoverMenuBook(null);
+                                void applyCover(target, null);
+                            }}
+                        >
+                            移除封面，恢复默认样式
+                        </button>
+                    </div>
+                </ContentDialog>
+            )}
+
             {showAppearanceDialog && (
                 <ReadingAppearanceDialog
                     appearance={appearance}
                     backgroundUrl={backgroundUrl}
+                    loadedFonts={loadedFonts}
                     onClose={() => setShowAppearanceDialog(false)}
                     onSave={onSaveAppearance}
                 />
@@ -499,6 +721,10 @@ export function ReadingShelf({ onOpenBook, onClose, appearance, backgroundUrl, o
 
             {showInteractionDialog && (
                 <ReadingInteractionDialog onClose={() => setShowInteractionDialog(false)} />
+            )}
+
+            {showProfileDialog && (
+                <ReadingProfileDialog onClose={() => setShowProfileDialog(false)} />
             )}
         </div>
     );

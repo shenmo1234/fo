@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect } from "react";
-import { Bot, ChevronDown, ChevronRight, Languages, Menu, Minus, PenLine, Rocket, SendHorizontal, X, ZoomIn } from "lucide-react";
+import { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect, type CSSProperties } from "react";
+import { ChevronDown, ChevronRight, Highlighter, Languages, Menu, Minus, PenLine, Rocket, SendHorizontal, X, ZoomIn } from "lucide-react";
 import {
     loadChapters,
     loadProgress,
@@ -17,24 +17,61 @@ import {
     saveReadingInteractionConfig,
     DEFAULT_READING_INTERACTION_CONFIG,
 } from "@/lib/reading-storage";
-import { generateAnnotationBatch, generateReadingChat, parseReadingDiscussResponse, type ReadingDiscussAction, type ReadingDiscussContext } from "@/lib/reading-engine";
+import { resolveUserIdentity } from "@/lib/settings-storage";
+import { loadReadingMarks, saveReadingMark, deleteReadingMark, readingMarkGroup, readingMarkGroupId } from "@/lib/reading-marks";
+import {
+    appendReadingAnnotationMemos,
+    deleteReadingAnnotationMemo,
+    loadReadingSummaryMemos,
+    updateReadingAnnotationMemoContent,
+    type ReadingAnnotationMemo,
+} from "@/lib/reading-memory";
+import { annotationExportFileName, buildAnnotationMarkdown } from "@/lib/reading-export";
+import { downloadFile } from "@/lib/download-utils";
+import { collectSelectionSegments, type ReadingSelectionSegment } from "./reading-selection";
+import { isUserAnnotation, type ReadingMark, type ReadingMarkStyle } from "@/lib/reading-types";
+import { generateAnnotationBatch, generateReadingChat, parseReadingDiscussResponse, summarizeReadingRange, type ReadingDiscussAction, type ReadingDiscussContext } from "@/lib/reading-engine";
 import { loadChatMessages, pushChatMessage, deleteChatMessage, editChatMessage, loadChatContacts, createOrGetSession, isReadingDiscussMessage } from "@/lib/chat-storage";
 import type { ChatMessage, ChatSession } from "@/lib/chat-storage";
 import { loadCharacters } from "@/lib/character-storage";
 import { parseAIResponse } from "@/lib/rich-message-parser";
 import { MessageBubble } from "@/components/chat/message-bubble";
 import { ContentDialog } from "@/components/ui/modal";
-import { Toggle } from "@/components/ui/form";
+import { Select, Toggle } from "@/components/ui/form";
 import { PdfPageRenderer } from "./reading-pdf-viewer";
-import { decodeTxtArrayBuffer, parsePdfPageRange, PDF_PAGES_PER_CHAPTER, parseTxtContent, parseEpubFile } from "@/lib/reading-parser";
+import { ReadingShareDialog } from "./reading-share-dialog";
+import { decodeTxtArrayBuffer, parsePdfPageRange, PDF_PAGES_PER_CHAPTER, parseTxtContent, parseEpubFile, parseMobiFile } from "@/lib/reading-parser";
 import type { Book, BookChapter, ReadingAnnotation, ReadingProgress } from "@/lib/reading-types";
 import type { Character } from "@/lib/character-types";
 import { splitBilingualText } from "@/lib/bilingual-text";
+import {
+    parseReadingImageMarker,
+    readingImageAssetKey,
+    type ReadingImageRef,
+} from "@/lib/reading-inline-image";
+import { loadReadingAsset } from "@/lib/reading-appearance";
 
 type TxtPageItem =
-    | { kind: "line"; text: string; chapterIndex: number; paragraphIndex: number; indent?: boolean; segEnd?: boolean }
+    | { kind: "line"; text: string; chapterIndex: number; paragraphIndex: number; indent?: boolean; segEnd?: boolean; charStart?: number }
     | { kind: "gap"; chapterIndex: number; paragraphIndex: number }
+    | { kind: "image"; image: ReadingImageRef; chapterIndex: number; paragraphIndex: number }
     | { kind: "annotation"; annotation: ReadingAnnotation; chapterIndex: number; paragraphIndex: number };
+
+/** 菜单半宽，避免贴着某个点算出来的位置把菜单顶出屏幕 */
+const MENU_HALF_WIDTH = 96;
+
+function clampMenuX(centerX: number, width: number): number {
+    return Math.min(Math.max(centerX, MENU_HALF_WIDTH), Math.max(MENU_HALF_WIDTH, width - MENU_HALF_WIDTH));
+}
+
+/** iOS 的 Copy / Look Up 条出现在选区上方还是下方，UIKit 没有公开规则，
+ *  实测同一本书里两种都出现过，跟着选区放就一定有撞上的时候。
+ *  但它永远「紧贴选区」，所以我们去离选区最远的那一端：
+ *  选区在上半屏就把菜单钉在页脚上方，在下半屏就钉在页眉下方，两者不可能重合。 */
+function selectionMenuStyle(placeAtTop: boolean, topOffset: number, footerHeight: number): React.CSSProperties {
+    if (placeAtTop) return { top: `${topOffset}px`, left: "50%", transform: "translateX(-50%)" };
+    return { bottom: `${footerHeight + 12}px`, left: "50%", transform: "translateX(-50%)" };
+}
 
 type ParagraphRef = {
     absoluteIndex: number;
@@ -105,14 +142,17 @@ function buildPdfChunkTitle(startPage: number, endPage: number): string {
 
 function buildParagraphRefsFromChapters(chapters: BookChapter[]): ParagraphRef[] {
     const refs: ParagraphRef[] = chapters.flatMap((chapter, currentChapterIndex) =>
-        chapter.paragraphs.map((text, paragraphIndex) => ({
+        chapter.paragraphs.flatMap((text, paragraphIndex) => (
+            // 插图占位不是正文，不该出现在给模型的段落里，也不该被批注
+            parseReadingImageMarker(text) ? [] : [{
             absoluteIndex: 0,
             chapterIndex: currentChapterIndex,
             paragraphIndex,
             text,
             pageNum: chapter.paragraphPages?.[paragraphIndex],
             yRatio: chapter.paragraphYPositions?.[paragraphIndex],
-        })),
+        }]
+        )),
     );
 
     for (let i = 0; i < refs.length; i += 1) {
@@ -228,10 +268,13 @@ function ReadingAnnotationContent({
 
 type Props = {
     book: Book;
+    /** 正文字体 / 字号 / 行距的指纹。变了就得重排——翻页模式的断行是按当时的
+     *  字体量出来的，阅读器返回书架时又不卸载，不重排就会用旧字体的断行位置。 */
+    appearanceKey?: string;
     onBack: () => void;
 };
 
-export function ReadingViewer({ book, onBack }: Props) {
+export function ReadingViewer({ book, appearanceKey, onBack }: Props) {
     const isPdf = book.format === "pdf";
     const [readingConfig, setReadingConfig] = useState(() => loadReadingInteractionConfig());
     // 阅读器保持挂载（返回书架不卸载），书架设置页保存后通过事件同步最新配置
@@ -248,6 +291,43 @@ export function ReadingViewer({ book, onBack }: Props) {
     const [annotations, setAnnotations] = useState<ReadingAnnotation[]>([]);
     const [generating, setGenerating] = useState(false);
     const [companionId, setCompanionId] = useState<string | null>(null);
+    const [marks, setMarks] = useState<ReadingMark[]>([]);
+    /** 插图序号 → objectURL。只为当前正在显示的章节加载，读到哪加载到哪 */
+    const [inlineImageUrls, setInlineImageUrls] = useState<Record<number, string>>({});
+    const [selectionInfo, setSelectionInfo] = useState<
+        {
+            text: string;
+            /** 划选覆盖的每一段。跨段划选时不止一条，按阅读顺序排好 */
+            segments: ReadingSelectionSegment[];
+            /** 菜单落点：系统菜单永远紧贴选区，所以我们去屏幕另一端 */
+            placeAtTop: boolean; topOffset: number;
+        } | null
+    >(null);
+    /** 点到已有的荧光笔/划线时弹出的删除菜单 */
+    const [markMenu, setMarkMenu] = useState<{ mark: ReadingMark; x: number; y: number } | null>(null);
+    const [shareTarget, setShareTarget] = useState<ReadingMark[] | null>(null);
+    /** 选字菜单要停在页脚正上方，页脚高度随安全区/字号变，量出来最稳 */
+    const footerRef = useRef<HTMLElement | null>(null);
+    const headerRef = useRef<HTMLElement | null>(null);
+    const surfaceRef = useRef<HTMLDivElement | null>(null);
+    const [footerHeight, setFooterHeight] = useState(96);
+    const [showMyAnnotation, setShowMyAnnotation] = useState(false);
+    const [showCharAnnotationMenu, setShowCharAnnotationMenu] = useState(false);
+    const [showMyMarksPanel, setShowMyMarksPanel] = useState(false);
+    const [exportNote, setExportNote] = useState("");
+    /** 面板里按章折叠要看全书；页面渲染用的 annotations 只覆盖读过的章节，两者分开 */
+    const [panelAnnotations, setPanelAnnotations] = useState<ReadingAnnotation[]>([]);
+    const [summaryMemos, setSummaryMemos] = useState<ReadingAnnotationMemo[]>([]);
+    const [showRangeSummary, setShowRangeSummary] = useState(false);
+    const [summaryRange, setSummaryRange] = useState<{ start: number; end: number }>({ start: 0, end: 0 });
+    const [summaryDraft, setSummaryDraft] = useState("");
+    const [summaryLabel, setSummaryLabel] = useState("");
+    const [summaryBusy, setSummaryBusy] = useState(false);
+    const [summaryNote, setSummaryNote] = useState("");
+    const [pendingQuote, setPendingQuote] = useState<
+        { text: string; chapterIndex: number; paragraphIndex: number } | null
+    >(null);
+    const [myAnnotationText, setMyAnnotationText] = useState("");
     const [immersive, setImmersive] = useState(true);
     const [showCharPicker, setShowCharPicker] = useState(false);
     const [charPickerClosing, setCharPickerClosing] = useState(false);
@@ -280,6 +360,7 @@ export function ReadingViewer({ book, onBack }: Props) {
     const [annotationBatchInput, setAnnotationBatchInput] = useState(String(isPdf ? 5 : 50));
     const [annotationDialogMode, setAnnotationDialogMode] = useState<AnnotationDialogMode | null>(null);
     const [showReadingSettings, setShowReadingSettings] = useState(false);
+    const [showTranslationDialog, setShowTranslationDialog] = useState(false);
     const [pdfRenderDraft, setPdfRenderDraft] = useState(() => ({
         pdfZoom: readingConfig.pdfZoom ?? 1,
         pdfPreloadRadius: readingConfig.pdfPreloadRadius ?? 3,
@@ -298,6 +379,9 @@ export function ReadingViewer({ book, onBack }: Props) {
     const [editingDiscussMessage, setEditingDiscussMessage] = useState<ChatMessage | null>(null);
     const [editingDiscussContent, setEditingDiscussContent] = useState("");
     const [activeAnnotationId, setActiveAnnotationId] = useState<string | null>(null);
+    /** 正在手动编辑的批注（自己写的和角色写的都能改） */
+    const [editingAnnotation, setEditingAnnotation] = useState<ReadingAnnotation | null>(null);
+    const [editingText, setEditingText] = useState("");
     const [annotationTranslationOverrides, setAnnotationTranslationOverrides] = useState<Record<string, boolean>>({});
     const longPressTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
     const readingMessagePressStartRef = useRef<{ x: number; y: number } | null>(null);
@@ -327,7 +411,14 @@ export function ReadingViewer({ book, onBack }: Props) {
     const chapterIndexRef = useRef(0);
     const chaptersLenRef = useRef(0);
     const [txtLayoutVersion, setTxtLayoutVersion] = useState(0);
+    // 外观改了就重排一次。分页那个 effect 已经把 txtLayoutVersion 列进依赖，
+    // 这里只负责把「字体变了」这件事翻译成它认识的信号。
+    useEffect(() => {
+        setTxtLayoutVersion((version) => version + 1);
+    }, [appearanceKey]);
     const [txtPages, setTxtPages] = useState<TxtPageItem[][]>([]);
+    /** 一页能放下的高度，同时用来限制插图的最大高度（翻页模式） */
+    const [imageMaxHeight, setImageMaxHeight] = useState(0);
     const [scrollFraction, setScrollFraction] = useState(0);
     const [flipAnim, setFlipAnim] = useState<{ direction: 'forward' | 'backward'; items: TxtPageItem[] } | null>(null);
 
@@ -356,6 +447,8 @@ export function ReadingViewer({ book, onBack }: Props) {
 
     const companion = companionId ? (enrichedContacts.find(c => c.characterId === companionId)?.char || loadCharacters().find(c => c.id === companionId)) : null;
     const bilingualTranslationEnabled = readingConfig.bilingualTranslationEnabled === true;
+    /** 翻页动画；老配置里没有这个字段时默认开着，和加开关之前的表现一致 */
+    const flipAnimationEnabled = readingConfig.pageFlipAnimation !== false;
     const defaultTranslationExpanded = readingConfig.collapseBilingualTranslation !== true;
     const isScrollMode = !isPdf && readingConfig.readingMode === "scroll";
     // 保持 ref 与最新状态同步（供长生命周期滚动回调读取）
@@ -385,6 +478,62 @@ export function ReadingViewer({ book, onBack }: Props) {
         setScrollFraction(actual);
     }, []);
     const currentChapter = chapters[chapterIndex];
+
+    /** 当前屏上会用到的插图序号。只加载这些，读完就放掉，
+     *  免得整本画册的图全挂在内存里。 */
+    const visibleImageIndices = useMemo(() => {
+        const source = isScrollMode ? windowChapters : (currentChapter ? [currentChapter] : []);
+        const indices = new Set<number>();
+        for (const chapter of source) {
+            for (const paragraph of chapter.paragraphs) {
+                const marker = parseReadingImageMarker(paragraph);
+                if (marker) indices.add(marker.index);
+            }
+        }
+        return [...indices].sort((a, b) => a - b);
+    }, [currentChapter, isScrollMode, windowChapters]);
+
+    useEffect(() => {
+        let cancelled = false;
+        const wanted = new Set(visibleImageIndices);
+        // 离开视野的先放掉（objectURL 不回收就一直占着内存）
+        setInlineImageUrls((prev) => {
+            let changed = false;
+            const next: Record<number, string> = {};
+            for (const [key, url] of Object.entries(prev)) {
+                if (wanted.has(Number(key))) next[Number(key)] = url;
+                else { URL.revokeObjectURL(url); changed = true; }
+            }
+            return changed ? next : prev;
+        });
+        void (async () => {
+            for (const index of visibleImageIndices) {
+                if (cancelled) return;
+                // 串行：这几张图和封面/字体共用一个 IndexedDB，并发打开会互相 block
+                const blob = await loadReadingAsset(readingImageAssetKey(book.id, index)).catch(() => null);
+                if (cancelled) return;
+                if (!blob || blob.size === 0) continue;
+                setInlineImageUrls((prev) => {
+                    if (prev[index]) return prev;
+                    return { ...prev, [index]: URL.createObjectURL(blob) };
+                });
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [book.id, visibleImageIndices]);
+
+    // 离开阅读器时把剩下的 objectURL 全放掉
+    useEffect(() => () => {
+        setInlineImageUrls((prev) => {
+            Object.values(prev).forEach((url) => URL.revokeObjectURL(url));
+            return {};
+        });
+    }, []);
+    // 批注署名用绑定的用户身份，不写死
+    const userDisplayName = useMemo(
+        () => resolveUserIdentity(companionId || undefined, "reading")?.name?.trim() || "我",
+        [companionId],
+    );
     const txtPagesChapterIndex = txtPages[0]?.find((item) => item.kind !== "gap")?.chapterIndex ?? txtPages[0]?.[0]?.chapterIndex;
     const txtPagesReadyForCurrentChapter = !isPdf && !isScrollMode && txtPages.length > 0 && txtPagesChapterIndex === chapterIndex;
     const showTxtLoading = !isPdf && (
@@ -402,17 +551,231 @@ export function ReadingViewer({ book, onBack }: Props) {
                         ? <div key={i} className="reading-line-gap" />
                         : item.kind === "annotation"
                             ? renderAnnotationItem(item.annotation)
-                            : <p key={i} className={`reading-line${item.indent ? " reading-line-indent" : ""}${item.segEnd ? " reading-line-seg-end" : ""}`}>{item.text}</p>
+                            : item.kind === "image"
+                                ? renderImageItem(item.image, i)
+                                : renderLine(item, i)
                 ))}
             </div>
         );
     };
 
-    // 批注块（翻页与滚动模式共用）：长按呼出 复制/删除 菜单
+    useEffect(() => { setMarks(loadReadingMarks(book.id)); }, [book.id]);
+
+    useEffect(() => {
+        const el = footerRef.current;
+        if (!el) return;
+        const sync = () => setFooterHeight(el.offsetHeight);
+        sync();
+        const observer = new ResizeObserver(sync);
+        observer.observe(el);
+        return () => observer.disconnect();
+    }, []);
+
+
+    /** 松手后读取选区：定位到覆盖的每一段，换算成段落内字符区间 */
+    const captureSelection = useCallback(() => {
+        const sel = typeof window !== "undefined" ? window.getSelection() : null;
+        if (!sel || sel.isCollapsed || sel.rangeCount === 0) { setSelectionInfo(null); return; }
+
+        const range = sel.getRangeAt(0);
+        const surface = surfaceRef.current;
+        if (!surface) { setSelectionInfo(null); return; }
+        // 跨段划选：拆成「每段一条」。批注卡片不带 data-paragraph，不会被算进来，
+        // 所以从正文划到下一段时，中间那张批注卡片的文字不会混进摘抄。
+        const segments = collectSelectionSegments(range, surface);
+        if (segments.length === 0) { setSelectionInfo(null); return; }
+        // 正文按数据里的段落切，不从 DOM 取：翻页模式下一段可能被切成好几行，
+        // 中间还可能夹着批注卡片
+        const selectedText = segments
+            .map((segment) => (chapters[segment.chapterIndex]?.paragraphs[segment.paragraphIndex] || "").slice(segment.start, segment.end))
+            .filter(Boolean)
+            .join("\n");
+        if (selectedText.trim().length < 2) { setSelectionInfo(null); return; }
+
+        const surfaceRect = surfaceRef.current?.getBoundingClientRect();
+        const rect = range.getBoundingClientRect();
+        const originY = surfaceRect?.top ?? 0;
+        const surfaceHeight = surfaceRect?.height ?? (typeof window !== "undefined" ? window.innerHeight : 812);
+        const headerRect = headerRef.current?.getBoundingClientRect();
+        const selectionCenterY = (rect.top + rect.bottom) / 2 - originY;
+        setSelectionInfo({
+            text: selectedText,
+            segments,
+            placeAtTop: selectionCenterY > surfaceHeight / 2,
+            topOffset: (headerRect ? headerRect.bottom - originY : 56) + 12,
+        });
+    }, [chapters]);
+
+    /** 点已有标记：iOS 的系统菜单只在有选区时出现，这里是单纯点击，就近弹自己的菜单 */
+    const handleSurfaceClick = (e: React.MouseEvent) => {
+        const sel = typeof window !== "undefined" ? window.getSelection() : null;
+        if (sel && !sel.isCollapsed) return; // 正在选字，交给选字菜单
+        const hit = (e.target as HTMLElement | null)?.closest<HTMLElement>("[data-mark-id]");
+        if (!hit) { setMarkMenu(null); return; }
+        const mark = marks.find(item => item.id === hit.dataset.markId);
+        if (!mark) return;
+        const rect = hit.getBoundingClientRect();
+        const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 375;
+        setMarkMenu({ mark, x: clampMenuX(rect.left + rect.width / 2, viewportWidth), y: rect.bottom });
+    };
+
+    const openShareDialog = (mark: ReadingMark) => {
+        setShareTarget(readingMarkGroup(marks, mark));
+        setMarkMenu(null);
+    };
+
+    const removeMark = (mark: ReadingMark) => {
+        // 跨段划出来的那几条是一体的，删一条就该整组消失
+        const group = readingMarkGroup(marks, mark);
+        const ids = new Set(group.map(item => item.id));
+        group.forEach(item => deleteReadingMark(book.id, item.id));
+        setMarks(prev => prev.filter(item => !ids.has(item.id)));
+        setMarkMenu(null);
+    };
+
+    const addMark = (style: ReadingMarkStyle) => {
+        if (!selectionInfo || selectionInfo.segments.length === 0) return;
+        // 跨段划选存成一组：渲染仍按段落切开，删除/批注/分享时按整组处理
+        const groupId = `mg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const createdAt = new Date().toISOString();
+        const created: ReadingMark[] = selectionInfo.segments.map((segment, index) => ({
+            id: `mk_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 6)}`,
+            bookId: book.id,
+            chapterIndex: segment.chapterIndex,
+            paragraphIndex: segment.paragraphIndex,
+            start: segment.start,
+            end: segment.end,
+            text: (chapters[segment.chapterIndex]?.paragraphs[segment.paragraphIndex] || "").slice(segment.start, segment.end),
+            style,
+            createdAt,
+            groupId,
+        }));
+        created.forEach(saveReadingMark);
+        setMarks(prev => [...prev, ...created]);
+        clearSelection();
+    };
+
+    const clearSelection = () => {
+        setSelectionInfo(null);
+        try { window.getSelection()?.removeAllRanges(); } catch { /* ignore */ }
+    };
+
+    useEffect(() => {
+        const onUp = () => { window.setTimeout(captureSelection, 10); };
+        document.addEventListener("pointerup", onUp);
+        document.addEventListener("selectionchange", onUp);
+        return () => {
+            document.removeEventListener("pointerup", onUp);
+            document.removeEventListener("selectionchange", onUp);
+        };
+    }, [captureSelection]);
+
+    /** 批注落库后同步往记忆日志追一条。没有共读角色时不写——没人可记。 */
+    const toAnnotationMemos = (list: ReadingAnnotation[]): ReadingAnnotationMemo[] =>
+        list
+            .filter(annotation => annotation.characterId)
+            .map(annotation => ({
+                id: annotation.id,
+                characterId: annotation.characterId,
+                bookId: book.id,
+                bookTitle: book.title,
+                chapterIndex: annotation.chapterIndex,
+                chapterTitle: chapters.find(chapter => chapter.index === annotation.chapterIndex)?.title || "",
+                authorType: annotation.authorType === "user" ? "user" as const : "character" as const,
+                quote: annotation.quote,
+                content: annotation.content,
+                createdAt: annotation.createdAt,
+            }));
+
+    /** 按章折叠的列表壳。当前章默认展开，其余收起，长书里才好找。 */
+    const renderChapterFoldList = (
+        sections: Array<{ index: number; count: number; rows: React.ReactNode }>,
+        emptyText: string,
+    ) => {
+        if (sections.length === 0) {
+            return <div className="reading-settings-inline-note"><span>{emptyText}</span></div>;
+        }
+        return (
+            <>
+                {sections.map(section => (
+                    <details key={section.index} className="reading-fold" open={section.index === chapterIndex}>
+                        <summary className="reading-fold-summary">
+                            <span>{chapters.find(chapter => chapter.index === section.index)?.title?.trim() || `第${section.index + 1}章`}</span>
+                            <span className="reading-fold-count">{section.count}</span>
+                        </summary>
+                        <div className="reading-fold-body">{section.rows}</div>
+                    </details>
+                ))}
+            </>
+        );
+    };
+
+    /** 导出全书批注。state 里的 annotations 只覆盖读过的章节，这里重新按章全量取一遍。 */
+    const exportAnnotations = async () => {
+        setExportNote("正在整理…");
+        try {
+            const groups = await Promise.all(chapters.map(chapter => loadAnnotations(book.id, chapter.index)));
+            const markdown = buildAnnotationMarkdown({
+                book,
+                chapters,
+                annotations: groups.flat(),
+                marks,
+                userName: userDisplayName,
+            });
+            await downloadFile(
+                new Blob([markdown], { type: "text/markdown;charset=utf-8" }),
+                annotationExportFileName(book),
+            );
+            setExportNote("");
+        } catch (err) {
+            setExportNote(err instanceof Error ? err.message : "导出失败");
+        }
+    };
+
+    const saveMyAnnotation = async () => {
+        const text = myAnnotationText.trim();
+        if (!text || !pendingQuote) return;
+        const annotation: ReadingAnnotation = {
+            id: `ann_user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            bookId: book.id,
+            chapterIndex: pendingQuote.chapterIndex,
+            paragraphIndex: pendingQuote.paragraphIndex,
+            // 用户批注仍记录当前共读的角色，便于「这条是写给谁看的」
+            characterId: companionId || "",
+            characterName: "",
+            content: text,
+            createdAt: new Date().toISOString(),
+            authorType: "user",
+            quote: pendingQuote.text,
+        };
+        await saveAnnotation(annotation);
+        appendReadingAnnotationMemos(toAnnotationMemos([annotation]));
+        setAnnotations(prev => [...prev, annotation]);
+        setShowMyAnnotation(false);
+        setMyAnnotationText("");
+        setPendingQuote(null);
+    };
+
+    /** 手动改批注。记忆区那条要一起改，否则角色嘴上记得的还是旧话。 */
+    const saveEditedAnnotation = async () => {
+        if (!editingAnnotation) return;
+        const content = editingText.trim();
+        if (!content || content === editingAnnotation.content) { setEditingAnnotation(null); return; }
+        const updated = { ...editingAnnotation, content };
+        await saveAnnotation(updated);
+        updateReadingAnnotationMemoContent(updated.id, content);
+        setAnnotations(prev => prev.map(item => (item.id === updated.id ? updated : item)));
+        setEditingAnnotation(null);
+        setEditingText("");
+    };
+
+    // 批注块（翻页与滚动模式共用）：长按呼出 编辑/复制/删除 菜单
     const renderAnnotationItem = (annotation: ReadingAnnotation) => (
         <div
             key={annotation.id}
-            className="reading-annotation reading-annotation-interactive"
+            // 菜单挂在卡片下沿外面，不抬层就会被下一张批注卡片盖住
+            className={`reading-annotation reading-annotation-interactive${activeAnnotationId === annotation.id ? " is-menu-open" : ""}`}
+            data-author={annotation.authorType === "user" ? "user" : "character"}
             data-no-nav="true"
             onPointerDown={() => {
                 longPressTimer.current = setTimeout(() => {
@@ -428,7 +791,9 @@ export function ReadingViewer({ book, onBack }: Props) {
                 if (activeAnnotationId && activeAnnotationId !== annotation.id) setActiveAnnotationId(null);
             }}
         >
-            <span className="reading-annotation-name">{annotation.characterName}</span>
+            <span className="reading-annotation-name">
+                {annotation.authorType === "user" ? userDisplayName : annotation.characterName}
+            </span>
             <ReadingAnnotationContent
                 text={annotation.content}
                 bilingualEnabled={bilingualTranslationEnabled}
@@ -437,6 +802,16 @@ export function ReadingViewer({ book, onBack }: Props) {
             />
             {activeAnnotationId === annotation.id && (
                 <div className="ctx-menu reading-annotation-menu" onClick={(e) => e.stopPropagation()}>
+                    <button
+                        onClick={() => {
+                            setEditingAnnotation(annotation);
+                            setEditingText(annotation.content);
+                            setActiveAnnotationId(null);
+                        }}
+                        className="ctx-menu-btn"
+                    >
+                        编辑
+                    </button>
                     <button
                         onClick={() => {
                             copyToClipboard(annotation.content);
@@ -457,17 +832,92 @@ export function ReadingViewer({ book, onBack }: Props) {
         </div>
     );
 
+    const marksByParagraph = useMemo(() => {
+        const map = new Map<string, ReadingMark[]>();
+        for (const mark of marks) {
+            const key = `${mark.chapterIndex}:${mark.paragraphIndex}`;
+            map.set(key, [...(map.get(key) || []), mark]);
+        }
+        return map;
+    }, [marks]);
+
+    /** 把落在本行区间内的荧光笔/划线切成 <mark>/<u> 片段 */
+    const renderLineContent = (item: Extract<TxtPageItem, { kind: "line" }>) => {
+        const lineStart = item.charStart ?? 0;
+        const lineEnd = lineStart + item.text.length;
+        const hits = (marksByParagraph.get(`${item.chapterIndex}:${item.paragraphIndex}`) || [])
+            .filter(mark => mark.start < lineEnd && mark.end > lineStart)
+            .sort((a, b) => a.start - b.start);
+        if (hits.length === 0) return item.text;
+
+        const nodes: React.ReactNode[] = [];
+        let cursor = lineStart;
+        hits.forEach((mark, i) => {
+            const from = Math.max(cursor, mark.start);
+            const to = Math.min(lineEnd, mark.end);
+            if (from > cursor) nodes.push(item.text.slice(cursor - lineStart, from - lineStart));
+            if (to > from) {
+                nodes.push(
+                    <span
+                        key={`${mark.id}-${i}`}
+                        className="reading-mark"
+                        data-style={mark.style}
+                        data-author={mark.authorType === "character" ? "character" : "user"}
+                        data-mark-id={mark.id}
+                    >
+                        {item.text.slice(from - lineStart, to - lineStart)}
+                    </span>,
+                );
+                cursor = to;
+            }
+        });
+        if (cursor < lineEnd) nodes.push(item.text.slice(cursor - lineStart));
+        return nodes;
+    };
+
+    const renderLine = (item: Extract<TxtPageItem, { kind: "line" }>, key: number) => (
+        <p
+            key={key}
+            className={`reading-line${item.indent ? " reading-line-indent" : ""}${item.segEnd ? " reading-line-seg-end" : ""}`}
+            data-chapter={item.chapterIndex}
+            data-paragraph={item.paragraphIndex}
+            data-charstart={item.charStart ?? 0}
+        >
+            {renderLineContent(item)}
+        </p>
+    );
+
+    /** 一张正文插图。图还没读出来时先占住位置（有原始尺寸就按比例占），
+     *  否则图片加载完会把正文顶得一跳一跳。 */
+    const renderImageItem = (image: ReadingImageRef, key: number | string) => {
+        const url = inlineImageUrls[image.index];
+        // 量不出原图尺寸时按正方形占位，和分页里的算法保持一致
+        const ratio = image.width > 0 && image.height > 0 ? `${image.width} / ${image.height}` : "1 / 1";
+        return (
+            <div key={key} className="reading-inline-image" style={{ aspectRatio: ratio }}>
+                {url
+                    // eslint-disable-next-line @next/next/no-img-element
+                    ? <img src={url} alt="" />
+                    : <span className="reading-inline-image-hint">插图</span>}
+            </div>
+        );
+    };
+
     const renderStaticPage = (items: TxtPageItem[]) => (
         <div className="reading-page-content">
             {items.map((item, i) =>
                 item.kind === "gap"
                     ? <div key={i} className="reading-line-gap" />
                     : item.kind === "annotation"
-                        ? <div key={i} className="reading-annotation">
-                            <span className="reading-annotation-name">{item.annotation.characterName}</span>
+                        ? <div key={i} className="reading-annotation" data-author={item.annotation.authorType === "user" ? "user" : "character"}>
+                            <span className="reading-annotation-name">
+                                {item.annotation.authorType === "user" ? userDisplayName : item.annotation.characterName}
+                            </span>
                             <span className="reading-annotation-text">{item.annotation.content}</span>
                         </div>
-                        : <p key={i} className={`reading-line${item.indent ? " reading-line-indent" : ""}${item.segEnd ? " reading-line-seg-end" : ""}`}>{item.text}</p>
+                        : item.kind === "image"
+                            ? renderImageItem(item.image, i)
+                            : <p key={i} className={`reading-line${item.indent ? " reading-line-indent" : ""}${item.segEnd ? " reading-line-seg-end" : ""}`}>{item.text}</p>
             )}
         </div>
     );
@@ -555,7 +1005,9 @@ export function ReadingViewer({ book, onBack }: Props) {
                     try {
                         const parsed = book.format === "txt"
                             ? parseTxtContent(decodeTxtArrayBuffer(await rawFile.arrayBuffer(), loadReadingInteractionConfig().txtEncoding).text, book.title)
-                            : await parseEpubFile(await rawFile.arrayBuffer(), book.title);
+                            : book.format === "mobi"
+                                ? await parseMobiFile(await rawFile.arrayBuffer(), book.title)
+                                : await parseEpubFile(await rawFile.arrayBuffer(), book.title);
                         const rebuiltChapters: BookChapter[] = parsed.chapters.map((chapter, index) => ({
                             id: `${book.id}_ch${index}`,
                             bookId: book.id,
@@ -838,6 +1290,26 @@ export function ReadingViewer({ book, onBack }: Props) {
         return buildPdfBatchRequest(size, mode, refs);
     }, [buildPdfBatchRequest, buildTxtBatchRequest, ensurePdfPageRangeParsed, getPdfBatchWindow, isPdf]);
 
+    /** 对话框里那行「本次范围」。用的就是真正生成时的那套算法（buildTxtBatchRequest /
+     *  getPdfBatchWindow），不是另算一遍，免得显示的范围和实际批注的范围对不上。 */
+    const annotationRangePreview = useMemo(() => {
+        if (!annotationDialogMode) return "";
+        const size = clampBatchSize(Number(annotationBatchInput));
+        const mode: AnnotationBatchMode = annotationDialogMode === "manual" ? "manual" : "auto-current";
+        if (isPdf) {
+            const window = getPdfBatchWindow(size, mode);
+            return window ? window.title : "";
+        }
+        const request = buildTxtBatchRequest(size, mode);
+        if (!request) return "";
+        const startChapter = chapters[request.items[0].chapterIndex]?.title;
+        const endChapter = chapters[request.items[request.items.length - 1].chapterIndex]?.title;
+        const chapterHint = startChapter && endChapter && startChapter !== endChapter
+            ? `（${startChapter} → ${endChapter}）`
+            : startChapter ? `（${startChapter}）` : "";
+        return `${request.title}${chapterHint}`;
+    }, [annotationBatchInput, annotationDialogMode, buildTxtBatchRequest, chapters, clampBatchSize, getPdfBatchWindow, isPdf]);
+
     const executeBatchAnnotation = useCallback(async (request: AnnotationBatchRequest, options?: { force?: boolean }): Promise<boolean> => {
         if (!companionId) return false;
         const batchKey = `${book.id}:${companionId}:${request.key}`;
@@ -858,7 +1330,7 @@ export function ReadingViewer({ book, onBack }: Props) {
             // 「本次阅读体验内不重复」由 generatedBatchesRef（内存）保证。
             const existing = await loadExistingAnnotationsForItems(request.items);
 
-            const newAnnotations = await withAnnotationRetry(
+            const { annotations: newAnnotations, marks: newMarks } = await withAnnotationRetry(
                 () => generateAnnotationBatch(
                     book,
                     request.title,
@@ -875,15 +1347,27 @@ export function ReadingViewer({ book, onBack }: Props) {
 
             generatedBatchesRef.current.add(batchKey);
 
+            // 角色顺手划的重点：只划线不写批注也算这一批有产出
+            if (newMarks.length > 0) {
+                newMarks.forEach(saveReadingMark);
+                setMarks((prev) => {
+                    const seen = new Set(prev.map(mark => mark.id));
+                    return [...prev, ...newMarks.filter(mark => !seen.has(mark.id))];
+                });
+            }
+
             if (newAnnotations.length > 0) {
                 await saveAnnotations(newAnnotations);
+                appendReadingAnnotationMemos(toAnnotationMemos(newAnnotations));
                 setAnnotations((prev) => {
                     const merged = new Map(prev.map((annotation) => [annotation.id, annotation]));
                     for (const annotation of newAnnotations) merged.set(annotation.id, annotation);
                     return [...merged.values()];
                 });
-            } else {
-                setAnnotationError("AI 没有返回批注（可能返回了[无批注]或API调用失败）");
+            } else if (newMarks.length === 0) {
+                // 解析失败、预设缺条目、接口报错现在都会抛出带原因的错误（见 generateAnnotationBatch），
+                // 能走到这里就只剩一种情况：模型看完了，但这一批它没什么想说的。
+                setAnnotationError(`${companion?.name || "AI"}这一批没有想写的批注（模型返回了「无批注」），可以换个范围再试`);
             }
             return true;
         } catch (err) {
@@ -1099,6 +1583,7 @@ export function ReadingViewer({ book, onBack }: Props) {
 
     const handleDeleteReadingAnnotation = useCallback(async (annotationId: string) => {
         await deleteAnnotation(annotationId);
+        deleteReadingAnnotationMemo(annotationId);
         setAnnotations((prev) => prev.filter((annotation) => annotation.id !== annotationId));
         setActiveAnnotationId(null);
     }, []);
@@ -1790,13 +2275,24 @@ export function ReadingViewer({ book, onBack }: Props) {
         }
 
         currentChapter.paragraphs.forEach((paragraph, index) => {
+            const imageMarker = parseReadingImageMarker(paragraph);
+            if (imageMarker) {
+                tokens.push({ kind: "image", image: imageMarker, chapterIndex, paragraphIndex: index });
+                if (index < currentChapter.paragraphs.length - 1) tokens.push({ kind: "gap", chapterIndex, paragraphIndex: index });
+                return;
+            }
             const segments = paragraph.split("\n");
+            // 段落内的字符游标：wrapTextToLines 不裁剪字符，各行拼接等于原段落，
+            // 所以逐行累加长度就能得到每行在段落中的起始偏移（荧光笔/划线按此定位）。
+            let charCursor = 0;
             segments.forEach((segment, segmentIndex) => {
                 const shouldIndent = segmentIndex === 0;
                 const wrappedLines = wrapTextToLines(segment, maxWidth, ctx, shouldIndent ? indentWidth : 0);
                 wrappedLines.forEach((line, lineIndex) => {
-                    tokens.push({ kind: "line", text: line, chapterIndex, paragraphIndex: index, indent: shouldIndent && lineIndex === 0, segEnd: lineIndex === wrappedLines.length - 1 });
+                    tokens.push({ kind: "line", text: line, chapterIndex, paragraphIndex: index, indent: shouldIndent && lineIndex === 0, segEnd: lineIndex === wrappedLines.length - 1, charStart: charCursor });
+                    charCursor += line.length;
                 });
+                if (segmentIndex < segments.length - 1) charCursor += 1; // 被 split 掉的 \n
                 if (segmentIndex < segments.length - 1) tokens.push({ kind: "gap", chapterIndex, paragraphIndex: index });
             });
             const paragraphAnnotations = annotationMap.get(index) || [];
@@ -1810,8 +2306,24 @@ export function ReadingViewer({ book, onBack }: Props) {
         let currentPage: TxtPageItem[] = [];
         let usedHeight = 0;
 
+        /** 插图占多高：按原图比例铺满正文宽度，最高不超过一页能放下的高度。
+         *  CSS 里用同一个数当 max-height，排版和实际渲染才对得上。 */
+        const measureImageHeight = (image: ReadingImageRef) => {
+            if (image.width > 0 && image.height > 0) {
+                return Math.min(maxHeight, Math.round((maxWidth * image.height) / image.width));
+            }
+            // 量不出原始尺寸（SVG 等）：留一块方方正正的位置
+            return Math.min(maxHeight, Math.round(maxWidth));
+        };
+
         for (const token of tokens) {
-            const tokenHeight = token.kind === "gap" ? gapHeight : token.kind === "annotation" ? measureAnnotationHeight(token.annotation) : lineHeight;
+            const tokenHeight = token.kind === "gap"
+                ? gapHeight
+                : token.kind === "annotation"
+                    ? measureAnnotationHeight(token.annotation)
+                    : token.kind === "image"
+                        ? measureImageHeight(token.image)
+                        : lineHeight;
             if (token.kind === "gap" && currentPage.length === 0) continue;
 
             if (currentPage.length > 0 && usedHeight + tokenHeight > maxHeight) {
@@ -1830,22 +2342,56 @@ export function ReadingViewer({ book, onBack }: Props) {
         if (pages.length === 0) pages.push([{ kind: "line", text: "", chapterIndex, paragraphIndex: 0 }]);
 
         lastTxtPaginationSignatureRef.current = paginationSignature;
+        setImageMaxHeight((prev) => (prev === maxHeight ? prev : maxHeight));
         setTxtPages(pages);
     }, [annotations, bilingualTranslationEnabled, chapterIndex, currentChapter, isAnnotationTranslationExpanded, isPdf, isScrollMode, txtLayoutVersion]);
 
     const txtTotalPages = txtPagesReadyForCurrentChapter ? txtPages.length : 1;
 
+    // 全书进度按字数加权：章节长度差距很大（几十字的版权页 vs 一万多字的正文章），
+    // 用「第几章 / 总章数」会让进度条和实际读了多少完全对不上。
+    const chapterCharStats = useMemo(() => {
+        const lengths = chapters.map(ch => ch.paragraphs.reduce((sum, p) => sum + p.length, 0));
+        const offsets: number[] = [];
+        let acc = 0;
+        for (const len of lengths) {
+            offsets.push(acc);
+            acc += len;
+        }
+        return { lengths, offsets, total: acc };
+    }, [chapters]);
+
+    /** 章内比例 → 全书比例。字数统计不可用时回退到按章数平均，保持旧行为。 */
+    const toBookFraction = useCallback((targetChapterIndex: number, withinChapter: number) => {
+        const within = Math.min(1, Math.max(0, withinChapter));
+        const { lengths, offsets, total } = chapterCharStats;
+        const chapterLength = lengths[targetChapterIndex];
+        if (total > 0 && chapterLength !== undefined) {
+            const read = (offsets[targetChapterIndex] ?? 0) + chapterLength * within;
+            return Math.min(1, Math.max(0, read / total));
+        }
+        return Math.min(1, Math.max(0, (targetChapterIndex + within) / Math.max(1, chapters.length)));
+    }, [chapterCharStats, chapters.length]);
+
     const navigateWithFlip = useCallback((direction: 'forward' | 'backward') => {
         if (flipAnim || isPdf) return;
+        // 正在选字时不要翻页，否则一松手就跳走
+        if (selectionInfo) return;
+        const sel = typeof window !== "undefined" ? window.getSelection() : null;
+        if (sel && !sel.isCollapsed) return;
+        // 拿不到当前页（分页尚未算完、或 txtPage 暂时越界）只说明没法放翻页动画，
+        // 不该把跳章也一起吞掉——否则读到章末会「翻不动」，只能手动点下一章。
         const currentItems = txtPages[txtPage];
-        if (!currentItems || currentItems.length === 0) return;
 
         const canForward = txtPage < txtTotalPages - 1 || chapterIndex < chapters.length - 1;
         const canBackward = txtPage > 0 || chapterIndex > 0;
         if (direction === 'forward' && !canForward) return;
         if (direction === 'backward' && !canBackward) return;
 
-        setFlipAnim({ direction, items: currentItems });
+        // 关掉动画就直接切页：flipAnim 是那层翻页覆盖物，不设它就没有动画
+        if (flipAnimationEnabled && currentItems && currentItems.length > 0) {
+            setFlipAnim({ direction, items: currentItems });
+        }
 
         if (direction === 'forward') {
             if (txtPage < txtTotalPages - 1) setTxtPage(p => p + 1);
@@ -1854,7 +2400,7 @@ export function ReadingViewer({ book, onBack }: Props) {
             if (txtPage > 0) setTxtPage(p => p - 1);
             else goToChapter(chapterIndex - 1, true);
         }
-    }, [flipAnim, isPdf, txtPages, txtPage, txtTotalPages, chapterIndex, chapters.length]);
+    }, [flipAnim, flipAnimationEnabled, isPdf, txtPages, txtPage, txtTotalPages, chapterIndex, chapters.length, selectionInfo]);
 
     const txtDisplayedPage = Math.min(txtPage + 1, txtTotalPages);
     const currentPageCount = isPdf ? Math.max(1, pdfTotalPages || 1) : Math.max(1, txtTotalPages);
@@ -1893,7 +2439,7 @@ export function ReadingViewer({ book, onBack }: Props) {
         } else if (isScrollMode) {
             const fraction = Math.max(0, Math.min(1, scrollFraction));
             scrollPosition = fraction;
-            progressFraction = Math.min(1, Math.max(0, (chapterIndex + fraction) / Math.max(1, chapters.length)));
+            progressFraction = toBookFraction(chapterIndex, fraction);
             progressCurrent = Math.max(1, Math.round(fraction * 100));
             progressTotal = 100;
             progressScope = "chapter";
@@ -1901,7 +2447,7 @@ export function ReadingViewer({ book, onBack }: Props) {
             const chapterPageCurrent = Math.max(1, txtPage + 1);
             const chapterPageTotal = Math.max(1, txtTotalPages);
             scrollPosition = txtPage;
-            progressFraction = Math.min(1, Math.max(0, (chapterIndex + chapterPageCurrent / chapterPageTotal) / Math.max(1, chapters.length)));
+            progressFraction = toBookFraction(chapterIndex, chapterPageCurrent / chapterPageTotal);
             progressCurrent = chapterPageCurrent;
             progressTotal = chapterPageTotal;
             progressScope = "chapter";
@@ -1920,7 +2466,7 @@ export function ReadingViewer({ book, onBack }: Props) {
             lastReadAt: new Date().toISOString(),
         };
         saveProgress(progress);
-    }, [book.id, chapterIndex, chapters.length, chaptersLoaded, companionId, isPdf, isScrollMode, pdfCurrentPage, pdfTotalPages, scrollFraction, txtPage, txtTotalPages]);
+    }, [book.id, chapterIndex, chapters.length, chaptersLoaded, companionId, isPdf, isScrollMode, pdfCurrentPage, pdfTotalPages, scrollFraction, toBookFraction, txtPage, txtTotalPages]);
 
     useEffect(() => {
         setTxtPage((prev) => Math.min(prev, Math.max(0, txtTotalPages - 1)));
@@ -2050,6 +2596,9 @@ export function ReadingViewer({ book, onBack }: Props) {
     };
 
     const handleTouchEnd = (e: React.TouchEvent) => {
+        // 拖动选区手柄同样会走到这里：有活动选区就别翻页，否则刚选好就被翻走
+        const sel = typeof window !== "undefined" ? window.getSelection() : null;
+        if (sel && !sel.isCollapsed) return;
         const dx = e.changedTouches[0].clientX - touchStartRef.current.x;
         const dy = e.changedTouches[0].clientY - touchStartRef.current.y;
         if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
@@ -2062,6 +2611,79 @@ export function ReadingViewer({ book, onBack }: Props) {
         : null;
 
     /** PDF 渲染设置先在弹窗内暂存，确认时只重建一次，避免拖动滑块期间连续重渲染整本 PDF。 */
+    const openRangeSummary = () => {
+        setSummaryMemos(loadReadingSummaryMemos(book.id, book.title));
+        setSummaryRange({ start: chapterIndex, end: chapterIndex });
+        setSummaryDraft("");
+        setSummaryLabel("");
+        setSummaryNote("");
+        setShowRangeSummary(true);
+    };
+
+    const runRangeSummary = async () => {
+        const from = Math.min(summaryRange.start, summaryRange.end);
+        const to = Math.max(summaryRange.start, summaryRange.end);
+        const picked = chapters.filter(chapter => chapter.index >= from && chapter.index <= to);
+        if (picked.length === 0) { setSummaryNote("这个范围里没有章节"); return; }
+        setSummaryBusy(true);
+        setSummaryNote("");
+        try {
+            const result = await summarizeReadingRange(book, picked);
+            setSummaryDraft(result.summary);
+            setSummaryLabel(result.rangeLabel);
+            // 截断是真会漏内容的（只总结了前面一部分），不能不说，但要说清楚是怎么回事
+            setSummaryNote(result.truncated ? "选的范围太长，只总结了前面一部分，建议分几次总结" : "");
+        } catch (err) {
+            setSummaryNote(err instanceof Error ? err.message : "总结失败");
+        } finally {
+            setSummaryBusy(false);
+        }
+    };
+
+    const loadPanelAnnotations = async () => {
+        const groups = await Promise.all(chapters.map(chapter => loadAnnotations(book.id, chapter.index)));
+        setPanelAnnotations(groups.flat());
+    };
+
+    const openMyAnnotationsPanel = () => {
+        setExportNote("");
+        setShowMyMarksPanel(true);
+        void loadPanelAnnotations();
+    };
+
+    const openCharAnnotationsPanel = () => {
+        setShowCharAnnotationMenu(true);
+        void loadPanelAnnotations();
+    };
+
+    const removeAnnotationEverywhere = async (annotationId: string) => {
+        await deleteAnnotation(annotationId);
+        deleteReadingAnnotationMemo(annotationId);
+        setAnnotations(prev => prev.filter(item => item.id !== annotationId));
+        setPanelAnnotations(prev => prev.filter(item => item.id !== annotationId));
+    };
+
+    const saveRangeSummary = () => {
+        const content = summaryDraft.trim();
+        if (!content || !companionId) return;
+        const from = Math.min(summaryRange.start, summaryRange.end);
+        appendReadingAnnotationMemos([{
+            id: `rsum_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            characterId: companionId,
+            bookId: book.id,
+            bookTitle: book.title,
+            chapterIndex: from,
+            chapterTitle: chapters.find(chapter => chapter.index === from)?.title || "",
+            authorType: "character",
+            content,
+            createdAt: new Date().toISOString(),
+            kind: "summary",
+            rangeLabel: summaryLabel,
+        }]);
+        setSummaryDraft("");
+        setSummaryMemos(loadReadingSummaryMemos(book.id, book.title));
+    };
+
     const openReadingSettings = () => {
         setPdfRenderDraft({
             pdfZoom: readingConfig.pdfZoom ?? 1,
@@ -2083,7 +2705,11 @@ export function ReadingViewer({ book, onBack }: Props) {
     };
 
     return (
-        <div className="reading-app-surface absolute inset-0 z-[100] flex flex-col bg-[var(--c-page-body-bg)]" data-immersive={immersive} style={{ paddingTop: "var(--page-header-safe-top, 48px)" }}>
+        <div ref={surfaceRef} className="reading-app-surface absolute inset-0 z-[100] flex flex-col bg-[var(--c-page-body-bg)]" data-immersive={immersive} style={{
+            paddingTop: "var(--page-header-safe-top, 48px)",
+            // 插图最高不超过一页能放下的高度，和分页算出来的那个数是同一个
+            ...(imageMaxHeight > 0 ? { ["--reading-image-max-height" as "--reading-image-max-height"]: `${imageMaxHeight}px` } : {}),
+        } as CSSProperties} onClick={handleSurfaceClick}>
             {/* Page flip overlay */}
             {flipAnim && (
                 <>
@@ -2100,7 +2726,7 @@ export function ReadingViewer({ book, onBack }: Props) {
             )}
 
             {/* Header — chapter name + page info */}
-            <header className={`reading-header ${immersive ? "reading-header--immersive" : "reading-header--revealed"}`} data-ui="header">
+            <header ref={headerRef} className={`reading-header ${immersive ? "reading-header--immersive" : "reading-header--revealed"}`} data-ui="header">
                 <div className="reading-header-top">
                     <button onClick={onBack} className="page-back-btn reading-header-back">
                         <svg width={18} height={18} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
@@ -2212,20 +2838,36 @@ export function ReadingViewer({ book, onBack }: Props) {
                         {windowChapters.map((chapter) => (
                             <div key={chapter.id} data-chapter-index={chapter.index}>
                                 {chapter.paragraphs.map((paragraph, pIndex) => {
+                                    const imageMarker = parseReadingImageMarker(paragraph);
+                                    if (imageMarker) {
+                                        return (
+                                            <div key={pIndex} className="reading-scroll-block">
+                                                {renderImageItem(imageMarker, `img-${chapter.index}-${pIndex}`)}
+                                            </div>
+                                        );
+                                    }
                                     const segmentCount = paragraph.split("\n").length;
                                     const paragraphAnnotations = annotations.filter(
                                         (annotation) => annotation.chapterIndex === chapter.index && annotation.paragraphIndex === pIndex
                                     );
                                     return (
                                         <div key={pIndex} className="reading-scroll-block">
-                                            {paragraph.split("\n").map((segment, sIndex) => (
-                                                <p
-                                                    key={sIndex}
-                                                    className={`reading-line reading-line-indent${sIndex === segmentCount - 1 ? " reading-line-seg-end" : ""}`}
-                                                >
-                                                    {segment}
-                                                </p>
-                                            ))}
+                                            {(() => {
+                                                let charCursor = 0;
+                                                return paragraph.split("\n").map((segment, sIndex) => {
+                                                    const charStart = charCursor;
+                                                    charCursor += segment.length + 1; // 被拆掉的 \n 也占一个字符
+                                                    return renderLine({
+                                                        kind: "line",
+                                                        text: segment,
+                                                        chapterIndex: chapter.index,
+                                                        paragraphIndex: pIndex,
+                                                        indent: true,
+                                                        segEnd: sIndex === segmentCount - 1,
+                                                        charStart,
+                                                    }, sIndex);
+                                                });
+                                            })()}
                                             {paragraphAnnotations.map((annotation) => renderAnnotationItem(annotation))}
                                         </div>
                                     );
@@ -2270,7 +2912,7 @@ export function ReadingViewer({ book, onBack }: Props) {
             </span>
 
             {/* Bottom bar — mirrors header style */}
-            <footer className="reading-footer">
+            <footer className="reading-footer" ref={footerRef}>
                 <div className="reading-footer-inner">
                     <div className="reading-footer-slider-row">
                         <button
@@ -2312,19 +2954,18 @@ export function ReadingViewer({ book, onBack }: Props) {
                         <button
                             type="button"
                             className={`reading-footer-icon-btn ${autoAnnotate ? "is-active" : ""}`}
-                            onClick={() => openAnnotationDialog("auto")}
+                            onClick={openCharAnnotationsPanel}
                         >
-                            <Bot size={22} strokeWidth={1.7} />
-                            <span>自动批注</span>
+                            <Highlighter size={22} strokeWidth={1.7} />
+                            <span>TA的批注</span>
                         </button>
                         <button
                             type="button"
                             className="reading-footer-icon-btn"
-                            onClick={() => openAnnotationDialog("manual")}
-                            disabled={generating || !companionId}
+                            onClick={openMyAnnotationsPanel}
                         >
-                            <PenLine size={22} strokeWidth={1.7} />
-                            <span>写批注</span>
+                            <Highlighter size={22} strokeWidth={1.7} />
+                            <span>我的批注</span>
                         </button>
                         {isPdf && (
                             <button
@@ -2566,11 +3207,11 @@ export function ReadingViewer({ book, onBack }: Props) {
                                     <span>
                                         {annotationDialogMode === "manual"
                                             ? (isPdf
-                                                ? `确认让${companion?.name || "AI"}为接下来几页生成批注`
-                                                : `确认让${companion?.name || "AI"}为接下来几个段落生成批注`)
+                                                ? `从当前页开始，往后几页交给${companion?.name || "AI"}批注`
+                                                : `从这一屏的第一段开始，往后几段交给${companion?.name || "AI"}批注（读完本章会接着下一章）`)
                                             : (isPdf
-                                                ? `开启后，先生成当前页所在批次；之后翻到新批次第一页时自动生成批注`
-                                                : `开启后，先生成当前段落所在批次；之后翻到新批次第一页时自动生成批注`)}
+                                                ? `每批几页。开启后先生成当前页所在的一批，之后翻到新一批的第一页时自动生成`
+                                                : `每批几段。开启后先生成当前段落所在的一批，之后读到新一批时自动生成`)}
                                     </span>
                                     <input
                                         value={annotationBatchInput}
@@ -2579,6 +3220,10 @@ export function ReadingViewer({ book, onBack }: Props) {
                                         inputMode="numeric"
                                     />
                                 </label>
+                                <div className="reading-settings-inline-note">
+                                    <span>本次范围</span>
+                                    <span>{annotationRangePreview || "（翻到正文页后才能算范围）"}</span>
+                                </div>
                                 <div className="reading-settings-inline-note">
                                     <span>默认值</span>
                                     <span>{isPdf ? "5 页" : "50 段"}</span>
@@ -2629,13 +3274,310 @@ export function ReadingViewer({ book, onBack }: Props) {
                     </div>
                 </ContentDialog>
             )}
-            {showReadingSettings && (
+            {selectionInfo && (
+                <div
+                    className="reading-selection-menu"
+                    style={selectionMenuStyle(selectionInfo.placeAtTop, selectionInfo.topOffset, footerHeight)}
+                    onPointerDown={(e) => e.stopPropagation()}
+                >
+                    <button type="button" onClick={() => addMark("highlight")}>高亮</button>
+                    <button type="button" onClick={() => addMark("underline")}>划线</button>
+                    <button type="button" onClick={clearSelection}>取消</button>
+                </div>
+            )}
+            {markMenu && (
+                <div
+                    className="reading-mark-menu"
+                    style={{ left: markMenu.x, top: markMenu.y + 8 }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => e.stopPropagation()}
+                >
+                    <button type="button" onClick={() => openShareDialog(markMenu.mark)}>分享</button>
+                    <button type="button" onClick={() => {
+                        const group = readingMarkGroup(marks, markMenu.mark);
+                        setPendingQuote({
+                            // 跨段划选时整段引用，锚点落在第一段
+                            text: group.map(item => item.text).join("\n"),
+                            chapterIndex: group[0].chapterIndex,
+                            paragraphIndex: group[0].paragraphIndex,
+                        });
+                        setMyAnnotationText("");
+                        setMarkMenu(null);
+                        setShowMyAnnotation(true);
+                    }}>批注</button>
+                    <button type="button" onClick={() => removeMark(markMenu.mark)}>删除</button>
+                    <button type="button" onClick={() => setMarkMenu(null)}>取消</button>
+                </div>
+            )}
+            {shareTarget && shareTarget.length > 0 && (() => {
+                const first = shareTarget[0];
+                const chapter = chapters[first.chapterIndex];
+                // 这段话在全书的位置：章内按「这一段之前有多少字」算，再换算到全书
+                const charsBefore = (chapter?.paragraphs || [])
+                    .slice(0, first.paragraphIndex)
+                    .reduce((sum, paragraph) => sum + paragraph.length, 0) + first.start;
+                const chapterChars = chapterCharStats.lengths[first.chapterIndex] || 0;
+                const withinChapter = chapterChars > 0 ? charsBefore / chapterChars : 0;
+                // 这几段上已有的批注也能一起带进图里
+                const markedParagraphs = new Set(shareTarget.map(item => `${item.chapterIndex}:${item.paragraphIndex}`));
+                const relatedAnnotations = annotations
+                    .filter(annotation => markedParagraphs.has(`${annotation.chapterIndex}:${annotation.paragraphIndex}`))
+                    .sort((a, b) => a.paragraphIndex - b.paragraphIndex || a.createdAt.localeCompare(b.createdAt))
+                    .map(annotation => ({
+                        name: isUserAnnotation(annotation) ? (userDisplayName || "我") : (annotation.characterName || "TA"),
+                        content: annotation.content,
+                        authorType: (isUserAnnotation(annotation) ? "user" : "character") as "user" | "character",
+                    }));
+                return (
+                    <ReadingShareDialog
+                        quoteParagraphs={shareTarget.map(item => item.text)}
+                        bookTitle={book.title}
+                        bookAuthor={book.author || ""}
+                        chapterTitle={chapter?.title || ""}
+                        progressPercent={toBookFraction(first.chapterIndex, withinChapter) * 100}
+                        annotations={relatedAnnotations}
+                        onClose={() => setShareTarget(null)}
+                    />
+                );
+            })()}
+            {showCharAnnotationMenu && (
                 <ContentDialog
-                    title="阅读设置"
+                    title="TA的批注"
+                    confirmLabel="关闭"
+                    cancelLabel=""
+                    onConfirm={() => setShowCharAnnotationMenu(false)}
+                    onCancel={() => setShowCharAnnotationMenu(false)}
+                >
+                    <div className="reading-settings-grid">
+                        {(() => {
+                            const theirs = panelAnnotations.filter(a => !isUserAnnotation(a));
+                            const indexes = Array.from(new Set(theirs.map(a => a.chapterIndex))).sort((a, b) => a - b);
+                            const sections = indexes.map(index => {
+                                const rows = theirs
+                                    .filter(a => a.chapterIndex === index)
+                                    .sort((a, b) => a.paragraphIndex - b.paragraphIndex);
+                                return {
+                                    index,
+                                    count: rows.length,
+                                    rows: (
+                                        <>
+                                            {rows.map(annotation => (
+                                                <div key={annotation.id} className="reading-mark-row">
+                                                    <span className="reading-my-annotation-row-body">
+                                                        {annotation.quote && <span className="reading-my-annotation-row-quote">{annotation.quote.slice(0, 40)}</span>}
+                                                        <span>{annotation.content}</span>
+                                                    </span>
+                                                    <button type="button" onClick={() => { void removeAnnotationEverywhere(annotation.id); }}>删除</button>
+                                                </div>
+                                            ))}
+                                        </>
+                                    ),
+                                };
+                            });
+                            return renderChapterFoldList(sections, "TA 还没有在这本书上写批注");
+                        })()}
+                    </div>
+                </ContentDialog>
+            )}
+            {showMyMarksPanel && (
+                <ContentDialog
+                    title="我的批注"
+                    confirmLabel="关闭"
+                    cancelLabel=""
+                    onConfirm={() => setShowMyMarksPanel(false)}
+                    onCancel={() => setShowMyMarksPanel(false)}
+                >
+                    <div className="reading-settings-grid">
+                        {(() => {
+                            const indexes = Array.from(new Set([
+                                ...panelAnnotations.filter(isUserAnnotation).map(a => a.chapterIndex),
+                                ...marks.map(m => m.chapterIndex),
+                            ])).sort((a, b) => a - b);
+
+                            const sections = indexes.map(index => {
+                                const mine = panelAnnotations
+                                    .filter(a => a.chapterIndex === index && isUserAnnotation(a))
+                                    .sort((a, b) => a.paragraphIndex - b.paragraphIndex);
+                                // 跨段划选出来的几条是一次划选，这里按组合成一行，
+                                // 否则一次跨三段的高亮会在列表里排成三条，看着像划了三次
+                                const groupedMarks = new Map<string, ReadingMark[]>();
+                                for (const mark of marks.filter(m => m.chapterIndex === index)) {
+                                    const key = readingMarkGroupId(mark);
+                                    const bucket = groupedMarks.get(key);
+                                    if (bucket) bucket.push(mark);
+                                    else groupedMarks.set(key, [mark]);
+                                }
+                                // 已经写了批注的标记不再单独列一条：批注那条里就带着这段原文
+                                const annotatedQuotes = new Set(mine.map(a => (a.quote ?? "").replace(/\s+/g, "")));
+                                const chapterMarks = [...groupedMarks.values()]
+                                    .map(group => group.sort((a, b) => a.paragraphIndex - b.paragraphIndex || a.start - b.start))
+                                    .filter(group => !annotatedQuotes.has(group.map(m => m.text).join("").replace(/\s+/g, "")))
+                                    .sort((a, b) => a[0].paragraphIndex - b[0].paragraphIndex || a[0].start - b[0].start);
+                                return {
+                                    index,
+                                    count: mine.length + chapterMarks.length,
+                                    rows: (
+                                        <>
+                                            {mine.map(annotation => (
+                                                <div key={annotation.id} className="reading-mark-row">
+                                                    <span className="reading-my-annotation-row-body">
+                                                        {annotation.quote && <span className="reading-my-annotation-row-quote">{annotation.quote.slice(0, 40)}</span>}
+                                                        <span>{annotation.content}</span>
+                                                    </span>
+                                                    <button type="button" onClick={() => { void removeAnnotationEverywhere(annotation.id); }}>删除</button>
+                                                </div>
+                                            ))}
+                                            {chapterMarks.map(group => (
+                                                <div key={group[0].id} className="reading-mark-row">
+                                                    <span className="reading-mark" data-style={group[0].style}>
+                                                        {group.map(mark => mark.text).join("").slice(0, 40)}
+                                                    </span>
+                                                    <button type="button" onClick={() => {
+                                                        const ids = new Set(group.map(mark => mark.id));
+                                                        group.forEach(mark => deleteReadingMark(book.id, mark.id));
+                                                        setMarks(prev => prev.filter(item => !ids.has(item.id)));
+                                                    }}>删除</button>
+                                                </div>
+                                            ))}
+                                        </>
+                                    ),
+                                };
+                            }).filter(section => section.count > 0);
+
+                            return renderChapterFoldList(sections, "这本书还没有你的批注或标记");
+                                                })()}
+                    </div>
+                </ContentDialog>
+            )}
+            {editingAnnotation && (
+                <ContentDialog
+                    title={isUserAnnotation(editingAnnotation) ? "编辑我的批注" : `编辑${editingAnnotation.characterName || "TA"}的批注`}
+                    confirmLabel="保存"
+                    cancelLabel="取消"
+                    onConfirm={() => { void saveEditedAnnotation(); }}
+                    onCancel={() => { setEditingAnnotation(null); setEditingText(""); }}
+                >
+                    <div className="reading-settings-grid">
+                        {editingAnnotation.quote && (
+                            <div className="reading-my-annotation-quote">{editingAnnotation.quote}</div>
+                        )}
+                        <textarea
+                            className="reading-my-annotation-input"
+                            value={editingText}
+                            onChange={(e) => setEditingText(e.target.value)}
+                            rows={5}
+                            autoFocus
+                        />
+                        <div className="reading-settings-inline-note">
+                            <span>说明</span>
+                            <span>改完之后记忆区里那条也会跟着改。</span>
+                        </div>
+                    </div>
+                </ContentDialog>
+            )}
+            {showMyAnnotation && pendingQuote && (
+                <ContentDialog
+                    title="我的批注"
+                    confirmLabel="保存"
+                    cancelLabel="取消"
+                    onConfirm={() => { void saveMyAnnotation(); }}
+                    onCancel={() => { setShowMyAnnotation(false); setPendingQuote(null); }}
+                >
+                    <div className="reading-settings-grid">
+                        <div className="reading-my-annotation-quote">{pendingQuote.text}</div>
+                        <textarea
+                            className="reading-my-annotation-input"
+                            value={myAnnotationText}
+                            onChange={(e) => setMyAnnotationText(e.target.value)}
+                            placeholder="写下你对这一段的想法……"
+                            rows={4}
+                        />
+                    </div>
+                </ContentDialog>
+            )}
+            {showRangeSummary && (
+                <ContentDialog
+                    title="总结内容"
+                    confirmLabel={summaryDraft.trim() ? "存进记忆" : "关闭"}
+                    cancelLabel="取消"
+                    onConfirm={() => { if (summaryDraft.trim()) saveRangeSummary(); else setShowRangeSummary(false); }}
+                    onCancel={() => setShowRangeSummary(false)}
+                >
+                    <div className="reading-settings-grid">
+                        <label className="reading-settings-label">
+                            <span>从</span>
+                            <Select
+                                value={String(summaryRange.start)}
+                                onChange={(e) => setSummaryRange(prev => ({ ...prev, start: Number(e.target.value) }))}
+                            >
+                                {chapters.map(chapter => (
+                                    <option key={chapter.id} value={chapter.index}>
+                                        {chapter.title?.trim() || `第${chapter.index + 1}章`}
+                                    </option>
+                                ))}
+                            </Select>
+                        </label>
+                        <label className="reading-settings-label">
+                            <span>到</span>
+                            <Select
+                                value={String(summaryRange.end)}
+                                onChange={(e) => setSummaryRange(prev => ({ ...prev, end: Number(e.target.value) }))}
+                            >
+                                {chapters.map(chapter => (
+                                    <option key={chapter.id} value={chapter.index}>
+                                        {chapter.title?.trim() || `第${chapter.index + 1}章`}
+                                    </option>
+                                ))}
+                            </Select>
+                        </label>
+                        <button
+                            type="button"
+                            className="ui-btn ui-btn-outline"
+                            onClick={() => { void runRangeSummary(); }}
+                            disabled={summaryBusy || !companionId}
+                        >
+                            {summaryBusy ? "总结中…" : summaryDraft ? "重新总结" : "生成总结"}
+                        </button>
+                        {summaryDraft && (
+                            <textarea
+                                className="reading-my-annotation-input"
+                                value={summaryDraft}
+                                onChange={(e) => setSummaryDraft(e.target.value)}
+                                rows={4}
+                            />
+                        )}
+                        {summaryNote && (
+                            <div className="reading-settings-inline-note"><span>{summaryNote}</span></div>
+                        )}
+                        {summaryMemos.length > 0 && (
+                            <>
+                                <div className="reading-settings-inline-note">
+                                    <span>已存的摘要</span>
+                                </div>
+                                {summaryMemos.map(memo => (
+                                    <div key={memo.id} className="reading-mark-row">
+                                        <span className="reading-my-annotation-row-body">
+                                            <span className="reading-my-annotation-row-quote">{memo.rangeLabel || memo.chapterTitle}</span>
+                                            <span>{memo.content}</span>
+                                        </span>
+                                        <button type="button" onClick={() => {
+                                            deleteReadingAnnotationMemo(memo.id);
+                                            setSummaryMemos(prev => prev.filter(item => item.id !== memo.id));
+                                        }}>删除</button>
+                                    </div>
+                                ))}
+                            </>
+                        )}
+                    </div>
+                </ContentDialog>
+            )}
+            {showTranslationDialog && (
+                <ContentDialog
+                    title="批注翻译"
                     confirmLabel="完成"
                     cancelLabel="关闭"
-                    onConfirm={handleReadingSettingsConfirm}
-                    onCancel={() => setShowReadingSettings(false)}
+                    onConfirm={() => setShowTranslationDialog(false)}
+                    onCancel={() => setShowTranslationDialog(false)}
                 >
                     <div className="reading-settings-grid">
                         <div className="reading-settings-inline-note">
@@ -2694,7 +3636,87 @@ export function ReadingViewer({ book, onBack }: Props) {
                                 />
                             </div>
                         )}
-
+                    </div>
+                </ContentDialog>
+            )}
+            {showReadingSettings && (
+                <ContentDialog
+                    title="阅读设置"
+                    confirmLabel="完成"
+                    cancelLabel="关闭"
+                    onConfirm={handleReadingSettingsConfirm}
+                    onCancel={() => setShowReadingSettings(false)}
+                >
+                    <div className="reading-settings-grid">
+                        <button
+                            type="button"
+                            className="ui-btn ui-btn-outline"
+                            onClick={() => { setShowReadingSettings(false); openAnnotationDialog("manual"); }}
+                            disabled={generating || !companionId}
+                        >
+                            现在批注
+                        </button>
+                        <button
+                            type="button"
+                            className="ui-btn ui-btn-outline"
+                            onClick={() => { setShowReadingSettings(false); openAnnotationDialog("auto"); }}
+                        >
+                            {autoAnnotate ? "自动批注：已开启" : "自动批注：已关闭"}
+                        </button>
+                        <button
+                            type="button"
+                            className="ui-btn ui-btn-outline"
+                            onClick={() => { setShowReadingSettings(false); openRangeSummary(); }}
+                            disabled={!companionId}
+                        >
+                            总结内容
+                        </button>
+                        <button
+                            type="button"
+                            className="ui-btn ui-btn-outline"
+                            onClick={() => { void exportAnnotations(); }}
+                        >
+                            导出全书批注（Markdown）
+                        </button>
+                        {exportNote && (
+                            <div className="reading-settings-inline-note"><span>{exportNote}</span></div>
+                        )}
+                        <button
+                            type="button"
+                            className="ui-btn ui-btn-outline"
+                            onClick={() => { setShowReadingSettings(false); setShowTranslationDialog(true); }}
+                        >
+                            批注翻译
+                        </button>
+                        <div className="reading-settings-inline-note">
+                            <span>批注密度</span>
+                            <span className="reading-interval-row">
+                                每
+                                <input
+                                    className="reading-interval-input"
+                                    type="number"
+                                    min={0}
+                                    max={999}
+                                    step={1}
+                                    inputMode="numeric"
+                                    value={readingConfig.annotationInterval}
+                                    onChange={(e) => {
+                                        const parsed = Math.floor(Number(e.target.value));
+                                        const next = {
+                                            ...readingConfig,
+                                            annotationInterval: Number.isFinite(parsed) ? Math.min(999, Math.max(0, parsed)) : 0,
+                                        };
+                                        setReadingConfig(next);
+                                        saveReadingInteractionConfig(next);
+                                    }}
+                                />
+                                段 1 条
+                            </span>
+                        </div>
+                        <div className="reading-settings-inline-note">
+                            <span>说明</span>
+                            <span>批注密度填 0 表示不限，由角色自己决定写多少</span>
+                        </div>
                         {isPdf && (
                             <section className="reading-settings-group">
                                 <div className="reading-settings-heading">
@@ -2759,6 +3781,10 @@ export function ReadingViewer({ book, onBack }: Props) {
                         <div className="reading-nav-chapter-list">
                             {chapters.map((chapter, index) => {
                                 const charCount = chapter.paragraphs.reduce((sum, p) => sum + p.replace(/\s+/g, "").length, 0);
+                                // 书自带目录里的层级：每深一层多缩进一点，最多缩三层
+                                const navIndent = chapter.tocLevel
+                                    ? { paddingLeft: `${16 + Math.min(chapter.tocLevel, 3) * 14}px` }
+                                    : undefined;
                                 const pageLabel = isPdf && chapter.pageStart ? chapter.pageStart : null;
                                 return (
                                     <button
@@ -2766,6 +3792,7 @@ export function ReadingViewer({ book, onBack }: Props) {
                                         type="button"
                                         className={`reading-nav-chapter-item${index === chapterIndex ? " is-active" : ""}`}
                                         onClick={() => handleNavChapterClick(index)}
+                                        style={navIndent}
                                     >
                                         <div className="reading-nav-chapter-main">
                                             <span className="reading-nav-chapter-name">{chapter.title || `第${index + 1}章`}</span>

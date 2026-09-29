@@ -4,6 +4,7 @@ import Dexie from "dexie";
 import type { Book, BookChapter, ReadingProgress, ReadingAnnotation } from "./reading-types";
 import { kvGet, kvSet, registerKvMigration } from "./kv-db";
 import { DEFAULT_READING_BILINGUAL_PROMPT } from "./bilingual-prompt-defaults";
+import { DEFAULT_READING_ANNOTATION_GUIDANCE, DEFAULT_READING_SUMMARY_PROMPT } from "./reading-prompt-defaults";
 
 // ── Database ──
 
@@ -68,8 +69,16 @@ export type ReadingInteractionConfig = {
     txtEncoding: "auto" | "utf-8" | "gb18030" | "gbk" | "big5" | "utf-16le" | "utf-16be";
     /** 阅读模式：翻页 / 连续滚动 */
     readingMode: ReadingViewMode;
+    /** 翻页模式的翻页动画；关掉就是直接切到下一页 */
+    pageFlipAnimation: boolean;
+    /** 批注要求：写什么、怎么写。格式要求不在这里，改坏了也不会把批注格式弄坏。 */
+    annotationGuidancePrompt: string;
+    /** 区间总结的要求 */
+    summaryPrompt: string;
     /** 自动批注失败时的静默重试次数（0=不重试） */
     annotationRetryCount: number;
+    /** 批注密度：大约每多少段写 1 条批注。0 = 不限（模型自己决定，等同加此设置之前的行为） */
+    annotationInterval: number;
     /** TXT 预批注：读到上一批批注阈值时提前生成下一批（TXT 按段落分批）；默认关闭，由用户手动开启 */
     autoAnnotatePrefetch: boolean;
     /** PDF 预批注：同上，但针对 PDF（按页分批）；默认关闭，由用户手动开启 */
@@ -93,7 +102,11 @@ export const DEFAULT_READING_INTERACTION_CONFIG: ReadingInteractionConfig = {
     paragraphMode: "auto",
     txtEncoding: "auto",
     readingMode: "page",
+    pageFlipAnimation: true,
+    annotationGuidancePrompt: DEFAULT_READING_ANNOTATION_GUIDANCE,
+    summaryPrompt: DEFAULT_READING_SUMMARY_PROMPT,
     annotationRetryCount: 3,
+    annotationInterval: 0,
     autoAnnotatePrefetch: false,
     autoAnnotatePrefetchPdf: false,
     annotationPrefetchThreshold: 2 / 3,
@@ -209,6 +222,16 @@ export async function saveAnnotations(annotations: ReadingAnnotation[]): Promise
         const [bookId, chapterIdx] = key.split(":");
         _annotationsCache.set(key, await db.annotations.where("[bookId+chapterIndex]").equals([bookId, Number(chapterIdx)]).toArray());
     }
+}
+
+/** 每本书的批注条数（用户 + 角色一起算）。书架上显示用，一次扫全表，
+ *  比按书逐次查省往返；批注量再大也就几千条。 */
+export async function countAnnotationsByBook(): Promise<Record<string, number>> {
+    const counts: Record<string, number> = {};
+    await db.annotations.each((annotation) => {
+        counts[annotation.bookId] = (counts[annotation.bookId] || 0) + 1;
+    });
+    return counts;
 }
 
 export async function deleteAnnotation(annotationId: string): Promise<void> {

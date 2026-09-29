@@ -9,7 +9,7 @@ import { loadMomentPosts, loadMomentComments } from "./moments-storage";
 import { loadCharacters } from "./character-storage";
 import { resolveUserIdentity } from "./settings-storage";
 import { loadMemoryConfig } from "./memory-storage";
-import type { MemoryConfig } from "./memory-types";
+import { resolveShortTermTokenBudget, type MemoryConfig } from "./memory-types";
 import { estimateTokens } from "./token-counter";
 import { loadStoryProjectionEntries } from "./story-storage";
 import { buildTwoLevelMomentThreads } from "./moments-comment-threading";
@@ -30,6 +30,7 @@ import { loadChatOfflineProjectionEntries } from "./chat-offline-storage";
 import { loadCheckPhoneProjectionEntries } from "./checkphone-storage";
 import { formatShoppingPaymentRequestHistory } from "./shopping-payment-request";
 import { loadCustomAppTimelineEntries } from "./custom-app-storage";
+import { formatReadingAnnotationMemo, loadReadingAnnotationMemos, readingMemoLabel } from "./reading-memory";
 import {
     canCharacterSeeMomentPost,
     getVisibleMomentCommentsForCharacter,
@@ -51,8 +52,8 @@ function formatPhotoDirectiveForPrompt(msg: ChatMessage): string {
 
 export type NativeTimelineEntry = {
     id: string;
-    sourceApp: "chat" | "moments" | "story" | "vn" | "map" | "game" | "diary" | "xiaohongshu" | "interview_magazine" | "cocreate" | "checkphone" | "custom_app";
-    sourceDetail?: "direct" | "group" | "system" | "story" | "chat_offline" | "game" | "diary_entry" | "notewall" | "xiaohongshu" | "black_market_theater" | "interview_issue" | "interview_shared_issue" | "cocreate_project" | "checkphone" | "custom_app_event"; // chat sub-type: 1:1 vs group chat vs system note
+    sourceApp: "chat" | "moments" | "story" | "vn" | "map" | "game" | "diary" | "xiaohongshu" | "interview_magazine" | "cocreate" | "checkphone" | "custom_app" | "reading";
+    sourceDetail?: "direct" | "group" | "system" | "story" | "chat_offline" | "game" | "diary_entry" | "notewall" | "xiaohongshu" | "black_market_theater" | "interview_issue" | "interview_shared_issue" | "cocreate_project" | "checkphone" | "custom_app_event" | "reading_annotation" | "reading_summary"; // chat sub-type: 1:1 vs group chat vs system note
     authorType?: "user" | "character" | "npc"; // who authored this entry
     postAuthorType?: "user" | "character"; // for moments: who owns the parent post
     sessionId?: string;
@@ -148,7 +149,11 @@ function formatDiaryEntryForTimeline(entry: DiaryEntry, timeAware: boolean, time
     const markerText = markers.length > 0 ? `（${markers.join(" / ")}）` : "";
     const title = entry.title.trim() || "未命名日记";
     const text = clipTimelineText(body || title, 900);
-    return `${formatPromptEventLabel("日记", entry.createdAt, timeAware, timestampOptions)} ${entry.characterName}写了一篇日记《${title}》${markerText}：${text}`;
+    const signaturePart = entry.authorType === "user" && entry.signature.trim() ? `（署名：${entry.signature.trim()}）` : "";
+    // 「我的日记」是用户手写给角色看的，不能说成是角色自己写的——那样会让模型误以为
+    // 这是角色自己的日记，读到里面对角色说的话时会自相矛盾。
+    const byline = entry.authorType === "user" ? `用户写了一篇给${entry.characterName}的日记` : `${entry.characterName}写了一篇日记`;
+    return `${formatPromptEventLabel("日记", entry.createdAt, timeAware, timestampOptions)} ${byline}《${title}》${markerText}：${text}${signaturePart}`;
 }
 
 /**
@@ -645,9 +650,14 @@ export function loadNativeTimeline(
     }
 
     // ── Diary entries ──
+    // 角色自己写日记时（appId === "diary"）不能把用户写的「我的日记」混进参考材料——
+    // 否则角色写自己的日记很容易变成回应用户日记，而不是像原来一样正常记录自己的生活。
+    // 其余场景（尤其是聊天）应该看到用户日记，让角色"记得"你写过它，所以只在这一个
+    // appId 上做排除，不是全局排除。
     const diaryEntries = loadDiaryEntries().filter(entry =>
         entry.characterId === characterId
         && (!options?.afterTimestamp || entry.createdAt > options.afterTimestamp)
+        && (options?.appId !== "diary" || entry.authorType !== "user")
     );
     for (const diaryEntry of diaryEntries) {
         entries.push({
@@ -786,13 +796,31 @@ export function loadNativeTimeline(
         });
     }
 
+    // ── Reading annotations & range summaries ──
+    // 只进批注和手动区间总结，不进荧光笔/划线——标记不带信息量，不该占记忆。
+    for (const memo of loadReadingAnnotationMemos()) {
+        if (memo.characterId !== characterId) continue;
+        if (options?.afterTimestamp && memo.createdAt <= options.afterTimestamp) continue;
+        entries.push({
+            id: `reading_anno_${memo.id}`,
+            sourceApp: "reading",
+            sourceDetail: memo.kind === "summary" ? "reading_summary" : "reading_annotation",
+            authorType: memo.authorType,
+            timestamp: memo.createdAt,
+            content: formatStoredPromptEventContent(
+                formatReadingAnnotationMemo(memo, { userName, characterName: charName }),
+                { label: readingMemoLabel(memo), timestamp: memo.createdAt, timeAware, timestampOptions },
+            ),
+        });
+    }
+
     // Sort by timestamp ascending
     entries.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
     return entries;
 }
 
 // Fixed order — lower = further from LLM output (appears higher in prompt)
-const FEATURE_ORDER: Record<string, number> = { map: 0, game: 0.5, moments: 1, xiaohongshu: 1.5, checkphone: 1.7, story: 2, vn: 2, theater: 2.2, interview: 2.35, cocreate: 2.4, diary_entry: 2.45, notewall: 2.5, custom_app: 2.6, group_chat: 3, chat: 4 };
+const FEATURE_ORDER: Record<string, number> = { map: 0, game: 0.5, moments: 1, xiaohongshu: 1.5, checkphone: 1.7, story: 2, vn: 2, theater: 2.2, interview: 2.35, cocreate: 2.4, diary_entry: 2.45, notewall: 2.5, custom_app: 2.6, reading: 2.7, group_chat: 3, chat: 4 };
 // Map appId → XML tag name for the "current feature" wrapper
 const FEATURE_TAG: Record<string, string> = {
     chat: "recent_chat",
@@ -807,6 +835,7 @@ const FEATURE_TAG: Record<string, string> = {
     checkphone: "recent_checkphone",
     interview_magazine: "recent_interview",
     cocreate: "recent_cocreate",
+    reading: "recent_reading",
 };
 
 function getFeatureTag(appId: string): string {
@@ -913,11 +942,29 @@ export function filterTimelineByAllowedSources(
  *
  * Returns `RecentBlock[]` + `truncatedHistory`.
  * All short-term content (timeline entries + history messages) is merged into one
- * timestamped pool and truncated from the oldest until total tokens ≤ shortTermTokenBudget.
+ * timestamped pool and truncated from the oldest until total tokens ≤ the app's
+ * short-term budget (shortTermTokenBudgetByApp[appId], else shortTermTokenBudget).
  *
  * For history-style appIds, the current feature's block has empty content because
  * the actual content is the history turns (wrapped by the assembler).
  */
+/** 该角色私聊会话的消息，过滤口径与时间线里那批 [私聊] 条目保持一致，
+ *  免得换成真实历史之后反而混进纯 UI 的提示消息。 */
+function loadDirectChatHistoryForPrompt(characterId: string): ChatMessage[] {
+    const session = loadChatSessions().find(s => !s.isGroup && s.contactId === characterId);
+    if (!session) return [];
+    return loadChatMessages(session.id).filter(msg => {
+        if (msg.isRetracted) return false;
+        if (isPromptHiddenChatMessage(msg)) return false;
+        if (msg.role === "system") {
+            if (msg.mediaType === "music_notify") return false;
+            if (msg.mediaType === "tool_notice") return false;
+            if (msg.mediaType === "memory_write_request") return false;
+        }
+        return true;
+    });
+}
+
 export function prepareShortTermContext(
     characterId: string,
     appId: string,
@@ -928,8 +975,15 @@ export function prepareShortTermContext(
         excludeOfflineSessionId?: string;
         includeNativeToolHistory?: boolean;
         includeDirectChatEntries?: boolean;
+        /** 把该角色的私聊会话当成真正的对话历史读入，让 user/char 的发言各自带上
+         *  user / assistant 角色，而不是压成 <shortTermMemory> 里的 [私聊] 文本流水。
+         *  一次性生成类（日记）用；同一批内容会从时间线事件里去掉，避免进两遍。 */
+        chatAsHistory?: boolean;
         timeAware?: boolean;
         promptTimestampOptions?: PromptTimestampOptions;
+        /** 分应用截断量按哪个应用算。默认就是 appId；只有少数功能（比如阅读批注
+         *  借用 chat 的装配方式）需要和装配用的 appId 分开。 */
+        budgetAppId?: string;
     },
 ): {
     recentBlocks: RecentBlock[];
@@ -951,12 +1005,17 @@ export function prepareShortTermContext(
 
     // Activation context: full timeline for keyword matching (not truncated)
     const wbActivationContext = timeline.slice(-10).map(e => e.content).join("\n");
-    const budget = memConfig.shortTermTokenBudget;
+    const budget = resolveShortTermTokenBudget(memConfig, options?.budgetAppId ?? appId);
     const currentTag = getFeatureTag(appId);
-    const history = options?.history ?? [];
+    const history = options?.history?.length
+        ? options.history
+        : (options?.chatAsHistory ? loadDirectChatHistoryForPrompt(characterId) : []);
     const characterName = loadCharacters().find(c => c.id === characterId)?.name ?? "角色";
-    const wrapsCurrentHistory = appId === "chat" || appId === "group_chat" || appId === "story" || appId === "vn" || appId === "adventure";
-    const skipDirectChatEntries = appId === "chat" && !options?.includeDirectChatEntries;
+    // 拿到了私聊历史才切换表示方式：一条都没读到（没有会话、存储还没 hydrate）时保持
+    // 原样走时间线事件，否则会既跳过事件又没有历史可放，把聊天上下文整段弄丢。
+    const chatAsHistory = options?.chatAsHistory === true && history.length > 0;
+    const wrapsCurrentHistory = appId === "chat" || appId === "group_chat" || appId === "story" || appId === "vn" || appId === "adventure" || chatAsHistory;
+    const skipDirectChatEntries = (appId === "chat" || chatAsHistory) && !options?.includeDirectChatEntries;
 
     // ── Collect non-history entries per block ──
     const raw: { tag: string; order: number; entries: NativeTimelineEntry[] }[] = [];
@@ -1036,6 +1095,14 @@ export function prepareShortTermContext(
     const customAppEntries = timeline.filter(e => e.sourceApp === "custom_app");
     if (customAppEntries.length > 0) {
         raw.push({ tag: "recent_custom_app", order: FEATURE_ORDER.custom_app, entries: customAppEntries });
+    }
+
+    // 共读批注 / 区间总结。时间线里一直有它们（记忆区就是读时间线），但没有任何一条
+    // raw.push 把它们收进提示词块，于是角色「记得」只体现在记忆区，模型一个字都收不到
+    // ——问角色书里的批注，它只能说没看见。
+    const readingEntries = timeline.filter(e => e.sourceApp === "reading");
+    if (readingEntries.length > 0) {
+        raw.push({ tag: "recent_reading", order: FEATURE_ORDER.reading, entries: readingEntries });
     }
 
     const groupChatEntries = timeline.filter(e =>
@@ -1223,7 +1290,7 @@ export function prepareGroupShortTermContext(
     ].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
     const wbActivationContext = activationPool.slice(-10).map(item => item.content).join("\n");
 
-    const budget = memConfig.shortTermTokenBudget;
+    const budget = resolveShortTermTokenBudget(memConfig, "group_chat");
 
     const raw: { tag: string; order: number; entries: NativeTimelineEntry[] }[] = [];
 
@@ -1294,6 +1361,14 @@ export function prepareGroupShortTermContext(
     const customAppEntries = timeline.filter(e => e.sourceApp === "custom_app");
     if (customAppEntries.length > 0) {
         raw.push({ tag: "recent_custom_app", order: FEATURE_ORDER.custom_app, entries: customAppEntries });
+    }
+
+    // 共读批注 / 区间总结。时间线里一直有它们（记忆区就是读时间线），但没有任何一条
+    // raw.push 把它们收进提示词块，于是角色「记得」只体现在记忆区，模型一个字都收不到
+    // ——问角色书里的批注，它只能说没看见。
+    const readingEntries = timeline.filter(e => e.sourceApp === "reading");
+    if (readingEntries.length > 0) {
+        raw.push({ tag: "recent_reading", order: FEATURE_ORDER.reading, entries: readingEntries });
     }
 
     const groupChatEntries = timeline.filter(e => e.sourceApp === "chat" && e.sourceDetail === "group");
@@ -1390,6 +1465,7 @@ export function prepareGroupShortTermContext(
                                         entry.sourceApp === "interview_magazine" ? "recent_interview" :
                                                 entry.sourceApp === "cocreate" ? "recent_cocreate" :
                                                     entry.sourceApp === "custom_app" ? "recent_custom_app" :
+                                                        entry.sourceApp === "reading" ? "recent_reading" :
                                                         entry.sourceApp === "story" && entry.sourceDetail === "black_market_theater" ? "recent_theater" :
                                                             entry.sourceApp === "diary" && entry.sourceDetail === "diary_entry" ? "recent_diary" :
                                                                 entry.sourceApp === "diary" && entry.sourceDetail === "notewall" ? "recent_notewall" :

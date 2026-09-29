@@ -1,11 +1,12 @@
 // lib/reading-engine.ts — LLM integration for Reading feature.
 // All prompts go through the preset system via assemblePromptPayload. No extra message push.
 
-import type { Book, BookChapter, ReadingAnnotation } from "./reading-types";
+import type { Book, BookChapter, ReadingAnnotation, ReadingMark, ReadingMarkStyle } from "./reading-types";
 import type { ChatSession } from "./chat-storage";
 import { loadChatMessages, pushChatMessage } from "./chat-storage";
 import { loadCharacters } from "./character-storage";
 import { loadReadingInteractionConfig } from "./reading-storage";
+import { DEFAULT_READING_ANNOTATION_GUIDANCE, DEFAULT_READING_SUMMARY_PROMPT } from "./reading-prompt-defaults";
 import {
     resolveBinding,
     loadBindingConfig,
@@ -14,12 +15,16 @@ import {
     loadWorldBooks,
     loadRegexes,
     resolveUserIdentity,
+    resolveAuxiliaryApiConfig,
 } from "./settings-storage";
 import {
+    applyOutputRegex,
     assemblePromptPayload,
+    ensureTrailingUserTurn,
     type AssemblerInput,
     type LLMMessage,
 } from "./llm-prompt-assembler";
+import { MacroEngine } from "./macro-engine";
 import type { ApiConfig, PresetConfig, RegexConfig } from "./settings-types";
 import { loadMemoryConfig } from "./memory-storage";
 import { retrieveCoreMemoriesForPrompt, retrieveMemoriesForPrompt } from "./memory-service";
@@ -27,6 +32,7 @@ import { formatCoreMemories, formatLongTermMemories } from "./memory-injector";
 import { prepareShortTermContext } from "./short-term-assembler";
 import { previewMessagesForApi, sendLLMRequest } from "./chat-engine";
 import { DEFAULT_READING_BILINGUAL_PROMPT, resolveBilingualPrompt } from "./bilingual-prompt-defaults";
+import { simpleLLMCall } from "./api-helpers";
 
 export type ReadingDiscussAction =
     | { type: "add_annotation"; paragraphIndex: number; content: string }
@@ -101,9 +107,11 @@ async function resolveReadingInput(
     const longTermMemories = await retrieveMemoriesForPrompt(characterId, options.bookTitle, memConfig);
 
     // Short-term context
+    // 装配方式沿用 chat（把私聊历史当真正的对话历史），但截断量按「阅读」单独算。
     const { recentBlocks, truncatedHistory, unifiedRecentItems } = prepareShortTermContext(characterId, "chat", {
         history: options.history,
         userName: userIdentity?.name ?? "用户",
+        budgetAppId: "reading",
     });
     const readingConfig = loadReadingInteractionConfig();
 
@@ -141,6 +149,7 @@ async function callReadingLLM(
     regexes?: RegexConfig[],
     appTags?: string[],
     userName?: string,
+    options?: { skipOutputRegex?: boolean },
 ): Promise<string> {
     return sendLLMRequest(
         config,
@@ -148,7 +157,7 @@ async function callReadingLLM(
         messages,
         regexes ?? [],
         { characterName, userName },
-        { appId: "reading", appTags },
+        { appId: "reading", appTags, skipOutputRegex: options?.skipOutputRegex },
     );
 }
 
@@ -165,6 +174,86 @@ function formatAnnotationHistory(annotations: ReadingAnnotation[]): string {
 
 function formatBatchChapterContent(targets: AnnotationTarget[]): string {
     return targets.map((target, index) => `[${index + 1}] ${target.text}`).join("\n\n");
+}
+
+/** 角色批注锚定片段的长度下限/上限。下限挡住「的」这种没有指向性的锚点，
+ *  上限比提示词里写的宽松一些：模型多抄几个字仍然应该认，只是别整段照抄。 */
+const ANCHOR_MIN_LENGTH = 2;
+const ANCHOR_PROMPT_MAX_LENGTH = 30;
+const ANCHOR_PARSE_MAX_LENGTH = 60;
+
+/** 在段落里定位模型给的片段。原样找不到时按去空白的形式再找一次，
+ *  还是找不到就返回 null，这条批注退回整段批注。 */
+function locateAnchor(paragraph: string, rawQuote: string): { quote: string; start: number; end: number } | null {
+    const quote = rawQuote.trim();
+    if (quote.length < ANCHOR_MIN_LENGTH || quote.length > ANCHOR_PARSE_MAX_LENGTH) return null;
+    const direct = paragraph.indexOf(quote);
+    if (direct >= 0) return { quote, start: direct, end: direct + quote.length };
+
+    const compact = quote.replace(/\s+/g, "");
+    if (compact.length < ANCHOR_MIN_LENGTH) return null;
+    // 段落里逐字扫描，跳过空白后逐字比对，命中即得到原文中的真实区间
+    for (let start = 0; start < paragraph.length; start += 1) {
+        let cursor = start;
+        let matched = 0;
+        while (cursor < paragraph.length && matched < compact.length) {
+            const ch = paragraph[cursor];
+            if (/\s/.test(ch)) { cursor += 1; continue; }
+            if (ch !== compact[matched]) break;
+            cursor += 1;
+            matched += 1;
+        }
+        if (matched === compact.length) return { quote: paragraph.slice(start, cursor), start, end: cursor };
+    }
+    return null;
+}
+
+/** 批注密度要求。拼在 chapterContent 末尾而不是写进预设条目：预设属于用户数据，
+ *  克隆过预设的人拿不到预设侧的改动，引擎侧拼接才对所有预设都生效。
+ *  interval <= 0 时返回空串，提示词与加此设置之前逐字一致。 */
+function formatAnnotationDensityHint(paragraphCount: number, interval: number): string {
+    if (!Number.isFinite(interval) || interval <= 0 || paragraphCount <= 0) return "";
+    const target = Math.max(1, Math.round(paragraphCount / interval));
+    return [
+        "",
+        "",
+        "<annotation_density>",
+        `本批共 ${paragraphCount} 段。请控制批注密度：大约每 ${interval} 段写 1 条，`
+        + `本批总共写 ${target} 条左右（可以上下浮动一两条）。`,
+        "宁可少写也不要为了凑数而评论平淡的段落；挑最值得说的那几段。",
+        "</annotation_density>",
+    ].join("\n");
+}
+
+/** 批注锚点要求。和密度要求一样拼在 chapterContent 末尾，不写进预设：
+ *  克隆过预设的人拿不到预设侧的改动，引擎侧拼接才对所有预设都生效。 */
+function formatAnnotationAnchorHint(): string {
+    return [
+        "",
+        "",
+        "<annotation_anchor>",
+        `每条批注请锚定到原文里的一个片段，写成：[批注:段落序号|原文片段]批注内容[/批注]`,
+        `「原文片段」必须逐字抄自该段原文，${ANCHOR_MIN_LENGTH} 到 ${ANCHOR_PROMPT_MAX_LENGTH} 字，不要跨段。`,
+        "挑你真正想说的那一句，而不是整段。抄不准原文时可以退回旧写法 [批注:段落序号]，仍然有效。",
+        "</annotation_anchor>",
+    ].join("\n");
+}
+
+/** 划线/高亮的用法。和上面两段一样拼在 chapterContent 末尾，对所有预设生效。 */
+function formatAnnotationMarkHint(): string {
+    return [
+        "",
+        "",
+        "<annotation_marks>",
+        "除了写批注，你也可以直接在原文上划重点，让{{user}}看见你读到哪儿会停下来：",
+        "[高亮:段落序号|原文片段]  给这句话加高亮",
+        "[划线:段落序号|原文片段]  给这句话画下划线",
+        `片段同样逐字抄自该段原文，${ANCHOR_MIN_LENGTH} 到 ${ANCHOR_PROMPT_MAX_LENGTH} 字，不要跨段。`,
+        "这两个标记不需要闭合，单独一行给出就行。",
+        "可以只划不写（默默划一道），也可以划完再写批注（两个标记都给出，指向同一句）；",
+        "当然也可以只写批注不划线。看你读到这句时是什么反应。",
+        "</annotation_marks>",
+    ].join("\n");
 }
 
 function formatBatchAnnotationHistory(annotations: ReadingAnnotation[], targets: AnnotationTarget[]): string {
@@ -268,7 +357,7 @@ export async function generateAnnotations(
     chapter: BookChapter,
     existingAnnotations: ReadingAnnotation[],
     characterId: string,
-): Promise<ReadingAnnotation[]> {
+): Promise<AnnotationBatchResult> {
     return generateAnnotationBatch(
         book,
         chapter.title,
@@ -282,27 +371,153 @@ export async function generateAnnotations(
     );
 }
 
+/** 区间总结一次最多送多少字的正文。请求里只有正文和一句指令，没有人设/世界书/记忆，
+ *  所以上限可以给得比走预设时宽松；再多就该分几次总结了。 */
+const SUMMARY_MAX_CHARS = 30000;
+
+export type ReadingRangeSummaryResult = {
+    /** 大约 50 字的总结正文 */
+    summary: string;
+    /** 人读的范围描述，直接进记忆区那一行 */
+    rangeLabel: string;
+    /** 正文是否因为超长被截断 */
+    truncated: boolean;
+};
+
+function buildRangeText(chapters: BookChapter[]): { text: string; truncated: boolean } {
+    const pieces: string[] = [];
+    let used = 0;
+    let truncated = false;
+    for (const chapter of chapters) {
+        const body = chapter.paragraphs.join("\n");
+        const head = `【${chapter.title || `第${chapter.index + 1}章`}】\n`;
+        // 拼接时章节之间还会插一个 "\n\n"，这两个字符也要算进预算，否则会超出上限
+        const separator = pieces.length > 0 ? 2 : 0;
+        const remaining = SUMMARY_MAX_CHARS - used - head.length - separator;
+        if (remaining <= 0) { truncated = true; break; }
+        const slice = body.length > remaining ? body.slice(0, remaining) : body;
+        if (slice.length < body.length) truncated = true;
+        pieces.push(head + slice);
+        used += separator + head.length + slice.length;
+    }
+    return { text: pieces.join("\n\n"), truncated };
+}
+
+/** 手动触发的区间总结。
+ *  走「辅助 API 绑定 → 记忆总结 API」，不走阅读绑定的预设：
+ *  总结要的是客观清楚，代入角色语气反而会走形；不带人设/世界书/记忆也省掉大把 token。 */
+export async function summarizeReadingRange(
+    book: Book,
+    chapters: BookChapter[],
+): Promise<ReadingRangeSummaryResult> {
+    if (chapters.length === 0) throw new Error("没有可总结的章节");
+
+    const apiConfig = resolveAuxiliaryApiConfig("memorySummaryApiConfigId");
+    if (!apiConfig) throw new Error("未配置记忆总结 API（设置 → 绑定管理 → 辅助 API 绑定）");
+
+    const first = chapters[0];
+    const last = chapters[chapters.length - 1];
+    const nameOf = (chapter: BookChapter) => chapter.title?.trim() || `第${chapter.index + 1}章`;
+    const rangeLabel = chapters.length === 1 ? nameOf(first) : `${nameOf(first)}—${nameOf(last)}`;
+
+    const { text, truncated } = buildRangeText(chapters);
+    const configuredSummaryPrompt = loadReadingInteractionConfig().summaryPrompt?.trim();
+    const instruction = [
+        `以下是《${book.title}》${rangeLabel}的正文。`,
+        configuredSummaryPrompt || DEFAULT_READING_SUMMARY_PROMPT,
+    ].join("\n");
+
+    const result = await simpleLLMCall(
+        apiConfig,
+        [{ role: "user", content: `${instruction}\n\n${text}` }],
+        { temperature: 0.3, label: `阅读区间总结·${book.title}` },
+    );
+    const summary = result.content?.trim();
+    if (!summary) throw new Error(result.error || "API 返回空内容");
+    return { summary, rangeLabel, truncated };
+}
+
+/** 模型回复里的一条批注标记。index 是「本批第几段」，已经换成 0 起。 */
+export type ParsedAnnotationMarker = { index: number; quote?: string; content: string };
+
+/** 拆 [批注:N|原文片段]批注内容[/批注]。片段可省略，老格式 [批注:N] 照样认。
+ *  方括号、冒号、竖线都放宽到全角——有些模型会把整段标点全角化，内容其实是对的，
+ *  为这个把整批批注丢掉太亏。 */
+export function parseAnnotationMarkers(responseText: string): ParsedAnnotationMarker[] {
+    const pattern = /[[［]批注[:：]\s*(\d+)\s*(?:[|｜]\s*([^\]］]*?)\s*)?[\]］]([\s\S]*?)[[［]\s*\/\s*批注\s*[\]］]/g;
+    const markers: ParsedAnnotationMarker[] = [];
+    let match;
+    while ((match = pattern.exec(responseText)) !== null) {
+        const index = parseInt(match[1], 10) - 1;
+        if (!Number.isFinite(index) || index < 0) continue;
+        const content = match[3].trim();
+        if (!content) continue;
+        markers.push({ index, ...(match[2] ? { quote: match[2] } : {}), content });
+    }
+    return markers;
+}
+
+/** 模型给的一道划线/高亮 */
+export type ParsedAnnotationMark = { index: number; quote: string; style: ReadingMarkStyle };
+
+/** 拆 [高亮:N|原文片段] / [划线:N|原文片段]。不需要闭合标签，单独一行就算数。
+ *  方括号和冒号照例放宽到全角。 */
+export function parseAnnotationMarkTags(responseText: string): ParsedAnnotationMark[] {
+    const pattern = /[[［](高亮|划线)[:：]\s*(\d+)\s*[|｜]\s*([^\]］]+?)\s*[\]］]/g;
+    const marks: ParsedAnnotationMark[] = [];
+    let match;
+    while ((match = pattern.exec(responseText)) !== null) {
+        const index = parseInt(match[2], 10) - 1;
+        const quote = match[3].trim();
+        if (!Number.isFinite(index) || index < 0 || !quote) continue;
+        marks.push({ index, quote, style: match[1] === "高亮" ? "highlight" : "underline" });
+    }
+    return marks;
+}
+
+/** 模型明确表示「这批没什么可写的」 */
+export function hasNoAnnotationMarker(responseText: string): boolean {
+    return /[[［]\s*无批注\s*[\]］]/.test(responseText);
+}
+
+export type AnnotationBatchResult = {
+    annotations: ReadingAnnotation[];
+    /** 角色顺手在原文上划的重点。模型没划就是空数组。 */
+    marks: ReadingMark[];
+};
+
 export async function generateAnnotationBatch(
     book: Book,
     batchTitle: string,
     targets: AnnotationTarget[],
     existingAnnotations: ReadingAnnotation[],
     characterId: string,
-): Promise<ReadingAnnotation[]> {
+): Promise<AnnotationBatchResult> {
     const character = loadCharacters().find(c => c.id === characterId);
     if (!character) throw new Error("角色不存在");
-    if (targets.length === 0) return [];
+    if (targets.length === 0) return { annotations: [], marks: [] };
 
     const resolved = await resolveReadingInput(characterId, ["reading", "annotate"], {
         bookTitle: book.title,
         chapterTitle: batchTitle,
-        chapterContent: formatBatchChapterContent(targets),
+        chapterContent: formatBatchChapterContent(targets)
+            + formatAnnotationDensityHint(targets.length, loadReadingInteractionConfig().annotationInterval)
+            + formatAnnotationAnchorHint()
+            + formatAnnotationMarkHint(),
         annotationHistory: formatBatchAnnotationHistory(existingAnnotations, targets),
     });
     if (!resolved) throw new Error("未找到 API 配置，请在设置中绑定 API");
 
     const { input, apiConfig, preset } = resolved;
-    const llmMessages = assemblePromptPayload(input);
+    const llmMessages = appendAnnotationGuidance(
+        assemblePromptPayload(input),
+        loadReadingInteractionConfig().annotationGuidancePrompt,
+    );
+    assertAnnotationPromptCarriesChapter(llmMessages);
+
+    // 批注走的是「标记协议」而不是给人看的正文，所以先拿未经输出正则处理的原文来解析：
+    // 用户的正则里常有清理方括号/行动描写的规则，套在这里会把 [批注:N] 标记本身吃掉，
+    // 于是无论换什么模型、什么中转站都解析不出批注。正则改为只作用在每条批注的内容上。
     const responseText = await callReadingLLM(
         apiConfig!,
         preset,
@@ -311,32 +526,103 @@ export async function generateAnnotationBatch(
         input.regexes,
         input.appTags,
         input.userIdentity?.name,
+        { skipOutputRegex: true },
     );
     if (!responseText) throw new Error("API 返回空内容");
-    if (responseText.includes("[无批注]")) return [];
 
-    // Parse [批注:N]...[/批注]
-    const pattern = /\[批注[:：](\d+)\]([\s\S]*?)\[\/批注\]/g;
+    const macroEngine = new MacroEngine(character.name, input.userIdentity?.name ?? "用户");
+    const cleanContent = (text: string) => applyOutputRegex(
+        text,
+        input.regexes ?? [],
+        { macroEngine, activeTags: input.appTags ?? ["reading", "annotate"] },
+    ).trim();
+
     const results: ReadingAnnotation[] = [];
-    let match;
-    while ((match = pattern.exec(responseText)) !== null) {
-        const relativeIndex = parseInt(match[1], 10) - 1;
-        const content = match[2].trim();
-        const target = targets[relativeIndex];
-        if (content && target) {
-            results.push({
-                id: `ra_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-                bookId: book.id,
-                chapterIndex: target.chapterIndex,
-                paragraphIndex: target.paragraphIndex,
-                characterId,
-                characterName: character.name,
-                content,
-                createdAt: new Date().toISOString(),
-            });
-        }
+    for (const parsed of parseAnnotationMarkers(responseText)) {
+        const target = targets[parsed.index];
+        const content = cleanContent(parsed.content);
+        if (!content || !target) continue;
+        const anchor = parsed.quote ? locateAnchor(target.text, parsed.quote) : null;
+        results.push({
+            id: `ra_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            bookId: book.id,
+            chapterIndex: target.chapterIndex,
+            paragraphIndex: target.paragraphIndex,
+            characterId,
+            characterName: character.name,
+            content,
+            createdAt: new Date().toISOString(),
+            ...(anchor ? { quote: anchor.quote, quoteStart: anchor.start, quoteEnd: anchor.end } : {}),
+        });
     }
-    return results;
+
+    // 角色划的重点。锚不到原文的直接丢掉——没有位置就画不上去。
+    const marks: ReadingMark[] = [];
+    const seenMarks = new Set<string>();
+    for (const parsed of parseAnnotationMarkTags(responseText)) {
+        const target = targets[parsed.index];
+        if (!target) continue;
+        const anchor = locateAnchor(target.text, parsed.quote);
+        if (!anchor) continue;
+        const key = `${target.chapterIndex}:${target.paragraphIndex}:${anchor.start}:${anchor.end}:${parsed.style}`;
+        if (seenMarks.has(key)) continue;
+        seenMarks.add(key);
+        marks.push({
+            id: `mk_ai_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            bookId: book.id,
+            chapterIndex: target.chapterIndex,
+            paragraphIndex: target.paragraphIndex,
+            start: anchor.start,
+            end: anchor.end,
+            text: anchor.quote,
+            style: parsed.style,
+            createdAt: new Date().toISOString(),
+            authorType: "character",
+            characterId,
+            characterName: character.name,
+        });
+    }
+
+    // 一条都没解析出来才认 [无批注]：模型有时会一边写批注一边解释「否则我会输出[无批注]」，
+    // 先判断会把写出来的批注全扔掉。角色只划了线没写批注也算正常一批，不该报错。
+    if (results.length === 0) {
+        if (marks.length > 0) return { annotations: [], marks };
+        if (hasNoAnnotationMarker(responseText)) return { annotations: [], marks: [] };
+        // 走到这里说明模型答了，但没按格式答。抛出去让重试接手，并把它到底说了什么带上，
+        // 否则用户只能看到「没有返回批注」，无从判断是模型、预设还是正则的问题。
+        throw new Error(
+            `模型没有按 [批注:段落序号]…[/批注] 的格式回复，这一批解析不出批注。`
+            + `它的开头是：「${responseText.trim().slice(0, 60)}」`,
+        );
+    }
+    return { annotations: results, marks };
+}
+
+/** 把「批注要求」接在提示词最后一条消息的末尾。
+ *  接在最后而不是塞进预设条目：预设属于用户数据，克隆过预设的人拿不到预设侧的改动；
+ *  而且放在最后离模型的输出最近，和预设里原有的批注条目冲突时以这段为准。 */
+function appendAnnotationGuidance(messages: LLMMessage[], guidance: string | undefined): LLMMessage[] {
+    const text = (guidance ?? DEFAULT_READING_ANNOTATION_GUIDANCE).trim();
+    if (!text || messages.length === 0) return messages;
+    const block = `\n\n<annotation_guidance>\n${text}\n</annotation_guidance>`;
+    const last = messages[messages.length - 1];
+    if (typeof last.content !== "string") return messages;
+    return [...messages.slice(0, -1), { ...last, content: last.content + block }];
+}
+
+/** 批注提示词必须真的带上正文。带不上只有一个原因：绑定的预设里没有「▸ 阅读·批注」
+ *  这一条（或被关掉了）——正文和格式要求都写在那条的 {{chapterContent}} 周围，
+ *  条目不在，模型就只收到人设，然后回一段普通聊天，看起来像「批注生成不出来」。
+ *  锚点要求是引擎侧拼在 chapterContent 末尾的，用它当探针最准。 */
+function assertAnnotationPromptCarriesChapter(messages: LLMMessage[]): void {
+    const hasChapter = messages.some((message) => (
+        typeof message.content === "string" && message.content.includes("<annotation_anchor>")
+    ));
+    if (hasChapter) return;
+    throw new Error(
+        "当前「阅读」绑定的预设里没有启用「▸ 阅读·批注」条目，模型收不到正文和批注格式要求。"
+        + "请到 设置 → 预设 里启用这一条（或把阅读改绑内置预设）后重试。",
+    );
 }
 
 export async function previewReadingAnnotationPrompt(
@@ -353,15 +639,23 @@ export async function previewReadingAnnotationPrompt(
         paragraphIndex,
         text,
     }));
+    // 预览必须和真正发出去的那份逐字一致，否则看了也白看
+    const config = loadReadingInteractionConfig();
     const resolved = await resolveReadingInput(characterId, ["reading", "annotate"], {
         bookTitle: book.title,
         chapterTitle: chapter.title,
-        chapterContent: formatBatchChapterContent(targets),
+        chapterContent: formatBatchChapterContent(targets)
+            + formatAnnotationDensityHint(targets.length, config.annotationInterval)
+            + formatAnnotationAnchorHint()
+            + formatAnnotationMarkHint(),
         annotationHistory: formatBatchAnnotationHistory(existingAnnotations, targets),
     });
     if (!resolved?.apiConfig) throw new Error("未找到 API 配置，请在设置中绑定 API");
 
-    const llmMessages = assemblePromptPayload(resolved.input);
+    const llmMessages = appendAnnotationGuidance(
+        assemblePromptPayload(resolved.input),
+        config.annotationGuidancePrompt,
+    );
     return {
         messages: previewMessagesForApi(resolved.apiConfig, resolved.preset, llmMessages),
         characterName: `阅读:${character.name}`,

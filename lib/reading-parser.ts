@@ -1,5 +1,8 @@
 // lib/reading-parser.ts — File parsing for TXT, EPUB, PDF.
 
+import { buildReadingImageMarker, parseReadingImageMarker } from "./reading-inline-image";
+import { READING_INLINE_IMAGE_MAX_SIZE, compressReadingImage } from "./reading-image";
+
 // ── PDF.js CDN loader ──
 const PDFJS_VERSION = "3.11.174"; // stable version available on cdnjs
 const PDFJS_CDN = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}`;
@@ -35,12 +38,26 @@ type PdfSource = ArrayBuffer | Blob;
 export type ParsedChapter = {
     title: string;
     paragraphs: string[];
+    /** 目录层级：0 = 顶层。来自 EPUB 自带的目录（nav / NCX），没有目录时不给。 */
+    tocLevel?: number;
 };
 
 export type ParsedBook = {
     title: string;
     author?: string;
     chapters: ParsedChapter[];
+    /** EPUB 里自带的封面图；没有就不给，书架退回自己画的那种封面 */
+    cover?: { data: ArrayBuffer; mime: string };
+    /** 正文插图。段落里用 \uFFFCimg:<index> 占位，这里给出每个 index 对应的图 */
+    images?: ReadingParsedImage[];
+};
+
+export type ReadingParsedImage = {
+    index: number;
+    blob: Blob;
+    /** 原图像素尺寸；解码不出来时是 0（SVG 等），排版按未知处理 */
+    width: number;
+    height: number;
 };
 
 export type TxtDecodeResult = {
@@ -361,6 +378,101 @@ function splitParagraphs(lines: string[], mode: TxtParagraphMode = "auto"): stri
  * Parse EPUB file into chapters and paragraphs.
  * EPUB is a ZIP containing XHTML files.
  */
+/** 量一张图的原始像素尺寸。解码不了（SVG、老浏览器）就返回 null，按未知处理。 */
+async function measureImageBlob(blob: Blob): Promise<{ width: number; height: number } | null> {
+    if (typeof createImageBitmap === "undefined") return null;
+    try {
+        const bitmap = await createImageBitmap(blob);
+        const size = { width: bitmap.width, height: bitmap.height };
+        bitmap.close();
+        return size;
+    } catch {
+        return null;
+    }
+}
+
+type TocEntry = { label: string; path: string; level: number };
+
+/** href 去掉锚点和 ./，再解码，用来和 manifest 里的路径对齐 */
+function normalizeTocHref(href: string, baseDir: string): string {
+    const withoutHash = href.split("#")[0].trim();
+    if (!withoutHash) return "";
+    let path = decodeURIComponent(withoutHash);
+    if (path.startsWith("./")) path = path.slice(2);
+    // 目录文件自己可能在子目录里，相对路径要按它所在目录拼
+    const combined = baseDir ? `${baseDir}${path}` : path;
+    // 压掉 a/b/../c 这种
+    const parts: string[] = [];
+    for (const piece of combined.split("/")) {
+        if (piece === "." || piece === "") continue;
+        if (piece === "..") { parts.pop(); continue; }
+        parts.push(piece);
+    }
+    return parts.join("/");
+}
+
+/** EPUB3 的导航文档：<nav epub:type="toc"><ol><li><a href>…，靠 <ol> 嵌套表示层级 */
+function parseNavDocument(xml: string, baseDir: string): TocEntry[] {
+    if (typeof DOMParser === "undefined") return [];
+    let doc: Document;
+    try {
+        doc = new DOMParser().parseFromString(xml, "application/xhtml+xml");
+        if (doc.querySelector("parsererror")) doc = new DOMParser().parseFromString(xml, "text/html");
+    } catch {
+        return [];
+    }
+    const navs = Array.from(doc.querySelectorAll("nav"));
+    const toc = navs.find((nav) => {
+        const type = nav.getAttribute("epub:type") || nav.getAttribute("type") || "";
+        return /\btoc\b/i.test(type);
+    }) || navs[0];
+    const root = toc?.querySelector("ol");
+    if (!root) return [];
+
+    const entries: TocEntry[] = [];
+    const walk = (list: Element, level: number) => {
+        for (const li of Array.from(list.children)) {
+            if (li.tagName.toLowerCase() !== "li") continue;
+            const anchorEl = li.querySelector(":scope > a, :scope > span > a");
+            const href = anchorEl?.getAttribute("href") || "";
+            const label = (anchorEl?.textContent || "").replace(/\s+/g, " ").trim();
+            const path = normalizeTocHref(href, baseDir);
+            if (label && path) entries.push({ label, path, level });
+            const childList = li.querySelector(":scope > ol");
+            if (childList) walk(childList, level + 1);
+        }
+    };
+    walk(root, 0);
+    return entries;
+}
+
+/** EPUB2 的 toc.ncx：<navMap><navPoint><navLabel><text>…，navPoint 嵌套表示层级 */
+function parseNcxDocument(xml: string, baseDir: string): TocEntry[] {
+    if (typeof DOMParser === "undefined") return [];
+    let doc: Document;
+    try {
+        doc = new DOMParser().parseFromString(xml, "application/xml");
+    } catch {
+        return [];
+    }
+    const navMap = doc.getElementsByTagName("navMap")[0];
+    if (!navMap) return [];
+
+    const entries: TocEntry[] = [];
+    const walk = (parent: Element, level: number) => {
+        for (const child of Array.from(parent.children)) {
+            if (child.tagName.replace(/^.*:/, "") !== "navPoint") continue;
+            const label = (child.getElementsByTagName("text")[0]?.textContent || "").replace(/\s+/g, " ").trim();
+            const href = child.getElementsByTagName("content")[0]?.getAttribute("src") || "";
+            const path = normalizeTocHref(href, baseDir);
+            if (label && path) entries.push({ label, path, level });
+            walk(child, level + 1);
+        }
+    };
+    walk(navMap, 0);
+    return entries;
+}
+
 export async function parseEpubFile(arrayBuffer: ArrayBuffer, fileName?: string): Promise<ParsedBook> {
     const JSZip = (await import("jszip")).default;
     const zip = await JSZip.loadAsync(arrayBuffer);
@@ -396,18 +508,101 @@ export async function parseEpubFile(arrayBuffer: ArrayBuffer, fileName?: string)
 
     // 4. Build id → href map from manifest
     const idToHref = new Map<string, string>();
+    // EPUB3 的导航文档（properties="nav"）本身就是一张目录页，阅读器已经有自己的
+    // 导航面板，把它当章节收进来只会在正文里多出一屏目录条目。
+    const navItemIds = new Set<string>();
+    const idToMime = new Map<string, string>();
+    let coverImageId = "";
     const manifestMatch = opfXml.match(/<manifest[^>]*>([\s\S]*?)<\/manifest>/i);
     if (manifestMatch) {
-        const itemPattern = /id="([^"]+)"[^>]*href="([^"]+)"/g;
-        let m;
-        while ((m = itemPattern.exec(manifestMatch[1])) !== null) {
-            idToHref.set(m[1], m[2]);
+        const itemTagPattern = /<item\b[^>]*>/gi;
+        let tag;
+        while ((tag = itemTagPattern.exec(manifestMatch[1])) !== null) {
+            const id = tag[0].match(/\bid="([^"]+)"/)?.[1];
+            const itemHref = tag[0].match(/\bhref="([^"]+)"/)?.[1];
+            if (!id || !itemHref) continue;
+            idToHref.set(id, itemHref);
+            const mime = tag[0].match(/\bmedia-type="([^"]+)"/)?.[1];
+            if (mime) idToMime.set(id, mime);
+            if (/\bproperties="[^"]*\bnav\b[^"]*"/i.test(tag[0])) navItemIds.add(id);
+            // EPUB3 的封面标记
+            if (/\bproperties="[^"]*\bcover-image\b[^"]*"/i.test(tag[0])) coverImageId = id;
         }
     }
 
-    // 5. Read each spine item and extract text
+    // EPUB2 用 <meta name="cover" content="ID">；再不行就找 id/href 里带 cover 的图片
+    if (!coverImageId) {
+        const metaCover = opfXml.match(/<meta\b[^>]*\bname="cover"[^>]*>/i)?.[0];
+        const candidate = metaCover?.match(/\bcontent="([^"]+)"/)?.[1];
+        if (candidate && idToHref.has(candidate)) coverImageId = candidate;
+    }
+    if (!coverImageId) {
+        for (const [id, itemHref] of idToHref) {
+            if (!idToMime.get(id)?.startsWith("image/")) continue;
+            if (/cover/i.test(id) || /cover/i.test(itemHref)) { coverImageId = id; break; }
+        }
+    }
+
+    let cover: ParsedBook["cover"];
+    const coverHref = coverImageId ? idToHref.get(coverImageId) : undefined;
+    const coverMime = coverImageId ? idToMime.get(coverImageId) : undefined;
+    if (coverHref && coverMime?.startsWith("image/")) {
+        const data = await zip.file(rootDir + decodeURIComponent(coverHref))?.async("arraybuffer");
+        if (data && data.byteLength > 0) cover = { data, mime: coverMime };
+    }
+
+    // 5. 读书自带的目录：章节名用目录里的名字，比从正文第一个标题猜准得多
+    //    （正文里常常「四 狗屋」在 <h2> 和正文里各出现一次，猜出来就是「四 狗屋 四 狗屋」）
+    const tocByPath = new Map<string, { label: string; level: number }>();
+    {
+        let tocXml = "";
+        let tocDir = rootDir;
+        // EPUB3：manifest 里 properties="nav" 的那份
+        for (const navId of navItemIds) {
+            const navHref = idToHref.get(navId);
+            if (!navHref) continue;
+            const navPath = rootDir + decodeURIComponent(navHref);
+            const text = await zip.file(navPath)?.async("text");
+            if (!text) continue;
+            tocXml = text;
+            tocDir = navPath.includes("/") ? navPath.substring(0, navPath.lastIndexOf("/") + 1) : "";
+            break;
+        }
+        let entries = tocXml ? parseNavDocument(tocXml, tocDir) : [];
+
+        // EPUB2：<spine toc="ncx">，或 manifest 里那份 x-dtbncx+xml
+        if (entries.length === 0) {
+            let ncxId = opfXml.match(/<spine[^>]*\btoc="([^"]+)"/i)?.[1] || "";
+            if (!ncxId) {
+                for (const [id, mime] of idToMime) {
+                    if (mime === "application/x-dtbncx+xml") { ncxId = id; break; }
+                }
+            }
+            const ncxHref = ncxId ? idToHref.get(ncxId) : undefined;
+            if (ncxHref) {
+                const ncxPath = rootDir + decodeURIComponent(ncxHref);
+                const ncxXml = await zip.file(ncxPath)?.async("text");
+                if (ncxXml) {
+                    const ncxDir = ncxPath.includes("/") ? ncxPath.substring(0, ncxPath.lastIndexOf("/") + 1) : "";
+                    entries = parseNcxDocument(ncxXml, ncxDir);
+                }
+            }
+        }
+
+        // 同一个文件可能被目录里的多条指向（靠锚点区分小节），取第一条
+        for (const entry of entries) {
+            if (!tocByPath.has(entry.path)) tocByPath.set(entry.path, { label: entry.label, level: entry.level });
+        }
+    }
+
+    // 6. Read each spine item and extract text
     const chapters: ParsedChapter[] = [];
+    // 插图：章节里的标记是「本章第几张」，这里换算成「全书第几张」，
+    // 同一张图被多处引用时只存一份。
+    const imagePathToIndex = new Map<string, number>();
+    const imagePaths: string[] = [];
     for (const itemId of spineItems) {
+        if (navItemIds.has(itemId)) continue;
         const href = idToHref.get(itemId);
         if (!href) continue;
         const filePath = rootDir + decodeURIComponent(href);
@@ -415,20 +610,204 @@ export async function parseEpubFile(arrayBuffer: ArrayBuffer, fileName?: string)
         if (!html) continue;
 
         // Extract text from HTML
-        const { title, paragraphs } = extractTextFromHtml(html);
+        const { title, paragraphs, imageSrcs } = extractTextFromHtml(html);
         if (paragraphs.length === 0) continue;
-        chapters.push({ title: title || `第${chapters.length + 1}章`, paragraphs });
+
+        let finalParagraphs = paragraphs;
+        if (imageSrcs && imageSrcs.length > 0) {
+            const chapterDir = filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/") + 1) : "";
+            const localToGlobal = new Map<number, number>();
+            imageSrcs.forEach((src, localIndex) => {
+                const resolved = normalizeTocHref(src, chapterDir);
+                if (!resolved) return;
+                let globalIndex = imagePathToIndex.get(resolved);
+                if (globalIndex === undefined) {
+                    globalIndex = imagePaths.length;
+                    imagePathToIndex.set(resolved, globalIndex);
+                    imagePaths.push(resolved);
+                }
+                localToGlobal.set(localIndex, globalIndex);
+            });
+            finalParagraphs = paragraphs.map((paragraph) => {
+                const marker = parseReadingImageMarker(paragraph);
+                if (!marker) return paragraph;
+                const globalIndex = localToGlobal.get(marker.index);
+                return globalIndex === undefined ? "" : buildReadingImageMarker(globalIndex);
+            }).filter((paragraph) => paragraph !== "");
+            if (finalParagraphs.length === 0) continue;
+        }
+
+        const fromToc = tocByPath.get(normalizeTocHref(href, rootDir));
+        chapters.push({
+            title: fromToc?.label || title || `第${chapters.length + 1}章`,
+            paragraphs: finalParagraphs,
+            ...(fromToc ? { tocLevel: fromToc.level } : {}),
+        });
+    }
+
+    // 7. 取出插图的字节，顺便量一下原图尺寸（翻页分页要用它算这张图占多高）
+    const images: ReadingParsedImage[] = [];
+    const droppedImages = new Set<number>();
+    for (let index = 0; index < imagePaths.length; index += 1) {
+        const data = await zip.file(imagePaths[index])?.async("blob");
+        if (!data || data.size === 0) { droppedImages.add(index); continue; }
+        const measured = await measureImageBlob(data);
+        // 1x1 透明占位、分隔线之类的小图没有阅读价值，只会在正文里留一行空白
+        if (measured && (measured.width < 40 || measured.height < 40)) { droppedImages.add(index); continue; }
+        const blob = await compressReadingImage(data, READING_INLINE_IMAGE_MAX_SIZE);
+        images.push({ index, blob, width: measured?.width ?? 0, height: measured?.height ?? 0 });
+    }
+
+    if (images.length > 0 || droppedImages.size > 0) {
+        const sizeByIndex = new Map(images.map((image) => [image.index, image]));
+        for (const chapter of chapters) {
+            chapter.paragraphs = chapter.paragraphs.map((paragraph) => {
+                const marker = parseReadingImageMarker(paragraph);
+                if (!marker) return paragraph;
+                if (droppedImages.has(marker.index)) return "";
+                const image = sizeByIndex.get(marker.index);
+                return buildReadingImageMarker(marker.index, image?.width ?? 0, image?.height ?? 0);
+            }).filter((paragraph) => paragraph !== "");
+        }
     }
 
     if (chapters.length === 0) {
-        return { title: bookTitle, author, chapters: [{ title: "全文", paragraphs: ["（EPUB 解析失败，未找到文本内容）"] }] };
+        return { title: bookTitle, author, cover, chapters: [{ title: "全文", paragraphs: ["（EPUB 解析失败，未找到文本内容）"] }] };
     }
 
-    return { title: bookTitle, author, chapters };
+    return { title: bookTitle, author, cover, chapters, ...(images.length > 0 ? { images } : {}) };
+}
+
+/** MOBI 里章节之间是 <mbp:pagebreak/>。切开后每一块当一章，走和 EPUB 相同的取文路径。 */
+export async function parseMobiFile(arrayBuffer: ArrayBuffer, fileName?: string): Promise<ParsedBook> {
+    const { parseMobiDocument } = await import("./reading-mobi");
+    const { html, title } = parseMobiDocument(arrayBuffer);
+    const bookTitle = title || fileName?.replace(/\.(mobi|azw3?|prc)$/i, "") || "未命名";
+
+    const pieces = html
+        .split(/<mbp:pagebreak[^>]*>/i)
+        .map(piece => piece.trim())
+        .filter(Boolean);
+
+    const chapters: ParsedChapter[] = [];
+    for (const piece of pieces) {
+        const { title: pieceTitle, paragraphs } = extractTextFromHtml(piece);
+        if (paragraphs.length === 0) continue;
+        chapters.push({ title: pieceTitle || `第${chapters.length + 1}章`, paragraphs });
+    }
+
+    // 没有分页符（或只切出一块）时退回 TXT 那套标题启发式，别让整本书挤成一章
+    if (chapters.length <= 1) {
+        const { paragraphs } = extractTextFromHtml(html);
+        if (paragraphs.length > 0) {
+            const parsed = parseTxtContent(paragraphs.join("\n\n"), fileName);
+            return { title: bookTitle, chapters: parsed.chapters };
+        }
+    }
+
+    if (chapters.length === 0) {
+        return { title: bookTitle, chapters: [{ title: "全文", paragraphs: ["（MOBI 解析失败，未找到文本内容）"] }] };
+    }
+    return { title: bookTitle, chapters };
+}
+
+const BLOCK_TAGS = new Set([
+    "P", "DIV", "LI", "BLOCKQUOTE", "TD", "TH", "DD", "DT", "PRE", "SECTION", "ARTICLE", "FIGURE", "FIGCAPTION",
+    "H1", "H2", "H3", "H4", "H5", "H6",
+]);
+
+/** 插图标记可能和文字挤在同一个块里（典型是 <figure> 里图配图注）。
+ *  把标记切出来单独成段，图和文字都不会丢；顺带保证标记绝不会混进正文文字里
+ *  ——那样既会显示成一个怪符号，也会被当成正文送进模型。 */
+function pushParagraphWithImages(paragraphs: string[], text: string): void {
+    if (!text) return;
+    if (!text.includes("\uFFFC")) { paragraphs.push(text); return; }
+    for (const piece of text.split(/(\uFFFCimg:\d+(?::\d+x\d+)?)/)) {
+        const trimmed = piece.trim();
+        if (trimmed) paragraphs.push(trimmed);
+    }
+}
+
+/** 正文提取（DOM 版）。
+ *  正则版遇到嵌套块（<div><p>…</p></div>）会错位，且去标签时不插分隔符，
+ *  相邻的行内元素会被粘成一坨（目录里的「八 革职」+「1」变成「八 革职1」）。
+ *  这里只取「叶子块」——本身不再包含块级后代的元素——避免父块和子块各产出一次。 */
+function extractTextFromDom(html: string): { title: string; paragraphs: string[]; imageSrcs?: string[] } | null {
+    if (typeof DOMParser === "undefined") return null;
+    let doc: Document;
+    try {
+        doc = new DOMParser().parseFromString(html, "text/html");
+    } catch {
+        return null;
+    }
+    const body = doc.body;
+    if (!body) return null;
+
+    body.querySelectorAll("script, style, nav[*|type='toc'], nav.toc").forEach((node) => node.remove());
+
+    const heading = body.querySelector("h1, h2, h3");
+    const title = normalizeInlineText(heading?.textContent || doc.querySelector("title")?.textContent || "");
+
+    // 插图：原地换成一条「标记段落」，保住它在正文里的位置。
+    // 下面的取文逻辑只看文字，图片元素本身不产出任何段落，不换的话图就没了。
+    const imageSrcs: string[] = [];
+    body.querySelectorAll("img, image").forEach((node) => {
+        const src = node.getAttribute("src")
+            || node.getAttribute("xlink:href")
+            || node.getAttribute("href")
+            || "";
+        if (!src.trim()) { node.remove(); return; }
+        const placeholder = doc.createElement("p");
+        placeholder.textContent = buildReadingImageMarker(imageSrcs.length);
+        // <image> 一般裹在 <svg> 里，整块换掉，免得留个空 svg
+        const target = node.tagName.toLowerCase() === "image" ? (node.closest("svg") || node) : node;
+        target.replaceWith(placeholder);
+        imageSrcs.push(src.trim());
+    });
+
+    const paragraphs: string[] = [];
+    const seenHeading = { done: false };
+    const visit = (node: Element) => {
+        const hasBlockChild = Array.from(node.children).some((child) => BLOCK_TAGS.has(child.tagName));
+        if (hasBlockChild) {
+            Array.from(node.children).forEach((child) => {
+                if (BLOCK_TAGS.has(child.tagName)) visit(child);
+            });
+            return;
+        }
+        const text = normalizeInlineText(node.textContent || "");
+        if (!text) return;
+        // 章节标题已经单独拿出来当章名了，正文里再出现一次就是重复
+        if (!seenHeading.done && node === heading && text === title) {
+            seenHeading.done = true;
+            return;
+        }
+        pushParagraphWithImages(paragraphs, text);
+    };
+    Array.from(body.children).forEach((child) => {
+        if (BLOCK_TAGS.has(child.tagName)) visit(child);
+        else {
+            pushParagraphWithImages(paragraphs, normalizeInlineText(child.textContent || ""));
+        }
+    });
+
+    if (paragraphs.length === 0) {
+        const plain = normalizeInlineText(body.textContent || "");
+        if (plain) paragraphs.push(plain);
+    }
+    return { title, paragraphs, imageSrcs };
+}
+
+/** 行内文本归一：把标签间的换行/缩进压成单空格，但不吞掉正常的词间空格。 */
+function normalizeInlineText(value: string): string {
+    return value.replace(/\s+/g, " ").trim();
 }
 
 /** Extract readable text from HTML/XHTML content. */
-function extractTextFromHtml(html: string): { title: string; paragraphs: string[] } {
+function extractTextFromHtml(html: string): { title: string; paragraphs: string[]; imageSrcs?: string[] } {
+    const fromDom = extractTextFromDom(html);
+    if (fromDom && fromDom.paragraphs.length > 0) return fromDom;
+
     // Try to extract title from <title> or <h1>-<h3>
     const titleMatch = html.match(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/i)
         || html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);

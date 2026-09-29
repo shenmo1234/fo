@@ -3349,9 +3349,24 @@
 .reading-list-meta {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  /* 批注条数和伴读角色也挂在这一行，窄屏放不下就换行，别把信息挤没 */
+  flex-wrap: wrap;
+  row-gap: 4px;
   font-size: calc(9.9px*var(--app-text-scale,1));
   color: var(--reading-warm-ink-tertiary, #999);
+}
+.reading-list-meta .reading-list-badge {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+/* 伴读的角色名可能很长，和「13章」一样是普通文本，但要能被截断 */
+.reading-list-meta-value {
+  min-width: 0;
+  max-width: 10em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .reading-list-progress-row {
   display: flex;
@@ -3690,7 +3705,6 @@
   background-position: center;
   background-repeat: no-repeat;
   color: var(--reading-warm-ink);
-  font-family: var(--reading-font-family, var(--app-font-family));
   backface-visibility: hidden;
   pointer-events: none;
   display: flex;
@@ -3770,7 +3784,6 @@
   --reading-warm-brown: #8a5a2b;
   --reading-warm-brown-light: #a39487;
 
-  font-family: var(--reading-font-family, var(--app-font-family));
   background-color: var(--reading-warm-bg) !important;
   background-image: var(--reading-bg-image, none) !important;
   background-size: cover !important;
@@ -3782,7 +3795,8 @@
 .reading-app-surface input,
 .reading-app-surface select,
 .reading-app-surface textarea {
-  font-family: var(--reading-font-family, var(--app-font-family));
+  /* 表单控件默认用系统字体，不跟着父级走，这里显式继承阅读字体 */
+  font-family: inherit;
 }
 .reading-app-surface .page-back-btn,
 .reading-app-surface .page-title,
@@ -3807,7 +3821,6 @@
   stroke: var(--reading-warm-brown-light, #a39487) !important;
 }
 .reading-paragraph {
-  font-family: var(--reading-font-family, var(--app-font-family));
   font-size: calc(var(--reading-font-size,16px)*0.9*var(--app-text-scale,1));
   line-height: var(--reading-line-height, 1.9);
   color: var(--reading-text-color, var(--reading-warm-ink, #111));
@@ -3908,6 +3921,13 @@
   padding: 4px 0;
   align-self: flex-start;
 }
+/* 阅读区的字体一律不走 CSS 变量。iOS Safari 上实测：同一条规则里
+   color: var(--x) 生效、font-family: var(--x) 不生效（整个阅读 app 退回系统字体），
+   而直接写在 style 上的 font-family 正常；Chromium 两种都正常。根因没能在
+   本机复现确认（手上只有 Chromium），所以干脆不依赖它——正文字体由 reading-app
+   内联在根节点上靠继承铺开，批注两档由 reading-app 注入 <style> 写死算好的值。
+   下面这段原本是批注字体的说明：批注没单独设字体时就跟随正文，
+   行为与只有单一字体变量时完全一致。 */
 .reading-annotation-text {
   display: block;
   font-size: calc(11.7px*var(--app-text-scale,1));
@@ -3918,10 +3938,57 @@
 .reading-annotation-bilingual-toggle {
   margin-top: 3px;
 }
+/* 用户批注：与角色批注左右错开、配色区分，便于一眼分辨是谁写的 */
+/* 我的批注和 TA 的批注只差颜色：以前这里还额外缩进 22px、右边留 4px，
+   于是同一屏上两种卡片一宽一窄，看着像两个组件。几何尺寸一律对齐基准卡片，
+   底色和文字颜色则由阅读外观里的设置下发。 */
+.reading-annotation[data-author="user"] {
+  background: #e7f0ff;
+  box-shadow:
+    1px 2px 6px rgba(20, 40, 80, 0.08),
+    inset 0 -1px 0 rgba(60, 100, 170, 0.1);
+}
+.reading-annotation[data-author="user"]::before {
+  background: rgba(190, 214, 250, 0.6);
+}
+.reading-annotation[data-author="user"] .reading-annotation-name {
+  color: #33507f;
+}
+.reading-annotation[data-author="user"] .reading-annotation-text {
+  color: #1e3050;
+}
+.reading-my-annotation-select,
+.reading-my-annotation-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--reading-warm-card-border, #f0e8da);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.7);
+  color: inherit;
+  font: inherit;
+  padding: 8px 9px;
+  outline: none;
+}
+.reading-my-annotation-input {
+  resize: vertical;
+  line-height: 1.6;
+}
+.reading-my-annotation-quote {
+  padding: 8px 10px;
+  border-left: 3px solid rgba(120, 100, 70, 0.35);
+  background: rgba(120, 100, 70, 0.06);
+  font-size: calc(12.5px*var(--app-text-scale,1));
+  line-height: 1.6;
+  color: rgba(70, 58, 42, 0.85);
+  max-height: 96px;
+  overflow: auto;
+}
 .reading-annotation-translation {
   margin-top: 4px;
   color: rgba(74, 61, 26, 0.65);
 }
+/* 我的批注字体可再单独指定；没设就回退到批注字体，再回退到正文，
+   与只有两级字体时的表现完全一致。 */
 .reading-chat-msg {
   padding: 6px 10px;
   border-radius: 8px;
@@ -4544,8 +4611,16 @@
   font-weight: 400;
 }
 
+/* 外层 .phone-workspace 统一关掉了 user-select（桌面端图标拖拽需要），
+   正文必须显式恢复，否则 iOS 上长按选不中任何文字。
+   -webkit-touch-callout 继续继承 none：用自己的浮动菜单代替系统菜单。 */
+.reading-line,
+.reading-line * {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 .reading-line {
-  font-family: var(--reading-font-family, var(--app-font-family));
   font-size: calc(var(--reading-font-size,16px)*0.9*var(--app-text-scale,1));
   line-height: var(--reading-line-height, 1.9);
   color: var(--reading-text-color, var(--reading-warm-ink, #111));
@@ -4774,6 +4849,29 @@
   align-items: center;
   justify-content: center;
   gap: 16px;
+}
+.reading-interval-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  font-size: calc(13px*var(--app-text-scale,1));
+  color: rgba(72, 60, 44, 0.75);
+}
+.reading-interval-input {
+  width: 72px;
+  padding: 7px 8px;
+  text-align: center;
+  border: 1px solid var(--reading-warm-card-border, #f0e8da);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.7);
+  color: inherit;
+  font: inherit;
+  font-size: calc(15px*var(--app-text-scale,1));
+  outline: none;
+}
+.reading-interval-input:focus {
+  border-color: rgba(120, 100, 70, 0.45);
 }
 .reading-retry-btn {
   width: 34px;
@@ -7225,4 +7323,460 @@
   border-radius: 1px;
   background: currentColor;
   animation: chat-stream-cursor-blink 1s steps(2, start) infinite;
+}
+
+/* ── 阅读：选区菜单 / 荧光笔 / 划线 ── */
+/* 选字菜单钉在离选区最远的一端（系统菜单紧贴选区，没法关掉也没法预测在哪一侧）。
+   具体钉页眉下还是页脚上由内联样式给。 */
+.reading-selection-menu {
+  position: absolute;
+  z-index: 60;
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 10px;
+  background: rgba(38, 32, 24, 0.94);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+}
+/* 点已有标记弹出的删除菜单：这是单纯点击、没有选区，系统菜单不会出现，就近显示 */
+.reading-mark-menu {
+  position: fixed;
+  z-index: 60;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 10px;
+  background: rgba(38, 32, 24, 0.94);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+}
+.reading-mark-menu button,
+.reading-selection-menu button {
+  border: 0;
+  background: transparent;
+  color: #fdf8ee;
+  font: inherit;
+  font-size: calc(12.5px*var(--app-text-scale,1));
+  padding: 6px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.reading-mark-menu button:active,
+.reading-selection-menu button:active { background: rgba(255, 255, 255, 0.16); }
+.reading-mark {
+  cursor: pointer;
+}
+.reading-mark[data-style="highlight"] {
+  background: rgba(255, 226, 120, 0.72);
+  border-radius: 2px;
+}
+.reading-mark[data-style="underline"] {
+  border-bottom: 2px solid rgba(190, 140, 60, 0.85);
+}
+/* 批注面板里按章折叠：长书里一屏列不完，当前章展开、其余收起 */
+/* 书自带封面时铺满整块，没有时仍然走下面那几种自己画的封面 */
+.reading-list-cover--image {
+  padding: 0;
+  overflow: hidden;
+  background: rgba(45, 35, 28, 0.06);
+}
+.reading-list-cover--image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.reading-fold {
+  border: 1px solid rgba(45, 35, 28, 0.08);
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.45);
+}
+.reading-fold-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  cursor: pointer;
+  list-style: none;
+  font-size: calc(12.5px*var(--app-text-scale,1));
+  color: var(--reading-warm-ink-secondary, #666);
+}
+.reading-fold-summary::-webkit-details-marker { display: none; }
+.reading-fold-count {
+  flex: 0 0 auto;
+  min-width: 20px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(45, 35, 28, 0.07);
+  font-size: calc(11px*var(--app-text-scale,1));
+  text-align: center;
+}
+.reading-fold-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 2px 12px 12px;
+}
+.reading-mark-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: calc(12.5px*var(--app-text-scale,1));
+}
+/* 「我的批注」面板里那条：左边原文片段 + 自己写的内容，右边删除 */
+.reading-my-annotation-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1 1 auto;
+  text-align: left;
+}
+.reading-my-annotation-row-quote {
+  padding-left: 7px;
+  border-left: 2px solid rgba(120, 100, 70, 0.35);
+  color: rgba(70, 58, 42, 0.7);
+  font-size: calc(11.5px*var(--app-text-scale,1));
+}
+.reading-mark-row button {
+  border: 0;
+  background: transparent;
+  color: rgba(150, 60, 50, 0.9);
+  font: inherit;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+/* 封面本身就是按钮（点它换封面）。按钮自带的边框/内边距全部抹掉，
+   尺寸仍然由里面的 .reading-list-cover 决定，列表布局和以前一致。 */
+.reading-list-cover-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  flex-shrink: 0;
+  line-height: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.reading-list-cover-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.reading-list-cover-btn .reading-list-cover {
+  transition: transform 0.12s;
+}
+.reading-list-cover-btn:active .reading-list-cover {
+  transform: scale(0.97);
+}
+
+/* 字体设置里的示例行：字体直接写在 style 上（不吃 --reading-font-family），
+   换一项就能当场看出这台设备到底有没有这个字体。 */
+.reading-font-preview {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px dashed rgba(45, 35, 28, 0.16);
+  background: rgba(255, 255, 255, 0.5);
+  color: var(--reading-text-color, var(--reading-warm-ink, #111));
+  font-size: calc(15px*var(--app-text-scale,1));
+  line-height: 1.55;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 字体诊断面板：报告用等宽小字，能直接截图看 */
+.reading-font-diag-report {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(45, 35, 28, 0.06);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: calc(10px*var(--app-text-scale,1));
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: rgba(60, 48, 35, 0.9);
+}
+
+/* 阅读账号：头像 + ID */
+.reading-profile-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.reading-profile-avatar {
+  flex: 0 0 auto;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  border: 1px dashed rgba(45, 35, 28, 0.22);
+  background: rgba(255, 255, 255, 0.5);
+  color: var(--reading-warm-brown-light, #a39487);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  padding: 0;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.reading-profile-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.reading-profile-avatar:active { transform: scale(0.97); }
+.reading-profile-fields {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 正文插图。高度上限用分页算出来的「一页能放下多少」，
+   这样翻页模式下图片不会被切成两页；滚动模式没有这个变量，退回 70vh。 */
+.reading-inline-image {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  max-height: var(--reading-image-max-height, 70vh);
+  margin: 2px 0;
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(45, 35, 28, 0.05);
+}
+.reading-inline-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.reading-inline-image-hint {
+  font-size: calc(10px*var(--app-text-scale,1));
+  letter-spacing: 0.1em;
+  color: var(--reading-warm-ink-tertiary, #999);
+}
+
+/* 下拉自己就说明了是什么，上面不再顶一行「字体」 */
+.reading-settings-label--bare {
+  gap: 0;
+}
+/* 高亮/划线取色的实时样张 */
+.reading-mark-preview {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  font-size: calc(12px*var(--app-text-scale,1));
+  color: var(--reading-warm-ink, #111);
+}
+/* 阅读 app 的自定义 CSS 输入框 */
+.reading-custom-css-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 120px;
+  resize: vertical;
+  padding: 10px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--reading-warm-card-border, #f0e8da);
+  background: rgba(255, 255, 255, 0.6);
+  color: var(--reading-warm-ink, #111);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+  font-size: calc(11px*var(--app-text-scale,1));
+  line-height: 1.6;
+  outline: none;
+}
+.reading-custom-css-input::placeholder {
+  color: var(--reading-warm-ink-tertiary, #b3a898);
+}
+
+/* ── 分享摘抄 ── */
+/* 模板选择放在图下面，一排小按钮就够，不需要描述 */
+.reading-share-templates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.reading-share-template {
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--reading-warm-card-border, #f0e8da);
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--reading-warm-ink, #111);
+  font-size: calc(11px*var(--app-text-scale,1));
+  -webkit-tap-highlight-color: transparent;
+}
+.reading-share-template.is-active {
+  border-color: var(--reading-warm-brown, #8a6b3d);
+  background: rgba(138, 107, 61, 0.12);
+  font-weight: 600;
+}
+.reading-share-preview {
+  display: flex;
+  justify-content: center;
+  max-height: 52vh;
+  overflow-y: auto;
+  border-radius: 10px;
+  background: rgba(45, 35, 28, 0.06);
+  padding: 8px;
+}
+.reading-share-canvas {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 6px;
+  box-shadow: 0 2px 10px rgba(40, 30, 20, 0.12);
+}
+
+/* 批注卡片的长按菜单挂在卡片下沿外面：菜单打开时把整张卡片抬上来，
+   否则会被紧随其后的另一张批注卡片盖住。 */
+.reading-annotation.is-menu-open {
+  z-index: 60;
+}
+
+/* 高亮/划线配色分「我划的」「TA 划的」两档 */
+.reading-mark-tier {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.4);
+  border: 1px solid var(--reading-warm-card-border, #f0e8da);
+}
+
+/* 分享摘抄：配色和对齐的调节区 */
+.reading-share-knobs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.reading-share-colors {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.reading-share-color {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  font-size: calc(10px*var(--app-text-scale,1));
+  color: var(--reading-warm-ink-secondary, #6b5f52);
+}
+.reading-share-aligns {
+  display: flex;
+  gap: 6px;
+}
+
+/* 阅读设置/外观里的折叠块：默认收起，点开再调 */
+.reading-settings-fold .reading-fold-summary {
+  font-size: calc(13px*var(--app-text-scale,1));
+  color: var(--reading-warm-ink, #111);
+  padding: 12px 14px;
+}
+.reading-settings-fold-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+.reading-settings-fold-hint {
+  font-size: calc(10.5px*var(--app-text-scale,1));
+  color: var(--reading-warm-ink-tertiary, #a3968a);
+  font-weight: 400;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 45%;
+}
+.reading-settings-fold[open] .reading-settings-fold-hint { display: none; }
+.reading-settings-fold .reading-fold-body {
+  gap: 12px;
+  padding: 4px 14px 14px;
+}
+
+/* 配色方案 chips */
+.reading-share-schemes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.reading-share-scheme {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  background: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.reading-share-scheme.is-active {
+  border-color: var(--reading-warm-brown, #8a6b3d);
+}
+.reading-share-scheme-swatch {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid rgba(45, 35, 28, 0.15);
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+.reading-share-scheme-swatch i {
+  position: absolute;
+  display: block;
+  width: 15px;
+  height: 30px;
+  top: 0;
+}
+.reading-share-scheme-swatch i:first-child { left: 0; }
+.reading-share-scheme-swatch i:last-child { right: 0; height: 15px; bottom: 0; top: auto; }
+
+/* 存档条：存一档 / 调出来 */
+.reading-preset-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.reading-preset-row,
+.reading-preset-naming {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.reading-preset-select,
+.reading-preset-naming .ui-input {
+  flex: 1;
+  min-width: 0;
+}
+/* 右边这几个方键：正方圆角，只放一个图标 */
+.reading-preset-icon-btn {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  border: 1px solid var(--reading-warm-card-border, #f0e8da);
+  background: rgba(255, 255, 255, 0.6);
+  color: var(--reading-warm-ink-secondary, #6b5f52);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+}
+.reading-preset-icon-btn:active { transform: scale(0.96); }
+.reading-preset-icon-btn.is-danger {
+  border-color: var(--c-danger, #fa5151);
+  color: var(--c-danger, #fa5151);
+  background: rgba(250, 81, 81, 0.08);
 }
